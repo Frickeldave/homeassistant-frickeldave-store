@@ -4,6 +4,10 @@ Das Panel wird von ``panel_custom`` direkt als ES-Modul importiert. Ein nackter
 Spezifizierer wie ``from "lit"`` lässt sich im Browser nicht auflösen, weil Home
 Assistant keine Import-Map ausliefert. Lit muss deshalb als vendored Bundle
 neben dem Panel liegen.
+
+Zusätzlich sichern strukturelle Prüfungen die statischen Verträge des
+Kamera-Capture-Controls im Bilder-Tab (Issue #321), ohne dafür einen
+Browser-Harness einzuführen.
 """
 
 from __future__ import annotations
@@ -94,3 +98,114 @@ def test_publish_buttons_share_icon_and_differ_by_badge() -> None:
         assert badge.group(1) == badge_text
         assert f'aria-label="Nach {label} veröffentlichen"' in button
         assert f'"Nach {label} veröffentlichen"' in button
+
+
+# ------------------------------------------------------------ Kamera-Aufnahme (Issue #321)
+
+
+def _capture_input_element(source: str) -> str:
+    """Vollständiges ``<input id="fd-image-capture" … />``-Element als Rohtext."""
+
+    start = re.search(r"""<input\b[^>]*?\bid=["']fd-image-capture["']""", source)
+    assert start, "Das Capture-Input #fd-image-capture fehlt im Bilder-Tab."
+
+    # Attributwerte enthalten ``>`` (Lit-Ausdrücke) — Klammerung zählen statt am ``/>`` schneiden.
+    depth = 0
+    for index in range(start.start(), len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        elif char == ">" and depth == 0:
+            return source[start.start() : index + 1]
+    raise AssertionError("Das Capture-Input ist nicht abgeschlossen.")
+
+
+#: Mikrotexte aus der Spezifikation. ``${MAX_IMAGES}`` wird zur Laufzeit zu ``10``.
+_CAPTURE_MICROTEXTS = [
+    "Foto aufnehmen",
+    "Ein Foto pro Aufnahme, bis zu 10 Bilder je Produkt.",
+    "Die maximale Anzahl ist erreicht. Bitte zuerst ein Bild löschen.",
+    "Es wurde kein Foto aufgenommen.",
+    "Kamera nicht verfügbar. Bitte die Kamera-Berechtigung der Home-Assistant-App in den "
+    "Systemeinstellungen prüfen.",
+    "Dieses Bildformat wird nicht unterstützt. Bitte ein Foto aufnehmen oder als JPEG hochladen.",
+]
+
+
+def _balanced_block(source: str, open_index: int) -> str:
+    """Inhalt zwischen ``source[open_index]`` (``{``) und der zugehörigen ``}``."""
+
+    depth = 0
+    for index in range(open_index, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_index + 1 : index]
+    raise AssertionError("Unbalancierte Klammern im Panel-Quelltext.")
+
+
+def _method_body(source: str, name: str) -> str:
+    match = re.search(rf"\b{name}\s*\([^)]*\)\s*\{{", source)
+    assert match, f"Methode {name} fehlt im Panel-Quelltext."
+    return _balanced_block(source, match.end() - 1)
+
+
+def _strip_js_comments(code: str) -> str:
+    without_block = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", without_block)
+
+
+def test_capture_input_targets_camera_and_accepts_single_photo() -> None:
+    element = _capture_input_element(PANEL_PATH.read_text(encoding="utf-8"))
+
+    assert re.search(r"""\btype=["']file["']""", element)
+    assert re.search(r"""\bcapture=["']environment["']""", element), (
+        'Ohne capture="environment" öffnet das Input den Datei-/Galerie-Dialog statt der Kamera.'
+    )
+    assert re.search(r"""\baccept=["']image/jpeg,image/png,image/webp,image/gif["']""", element)
+    assert not re.search(r"\bmultiple\b", element), (
+        "Das Capture-Input darf kein `multiple` tragen: Die Kamera liefert genau ein Foto."
+    )
+
+
+def test_capture_control_is_hidden_unless_pointer_is_coarse() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    media = re.search(r"@media\s*\(\s*pointer\s*:\s*coarse\s*\)\s*\{", source)
+
+    assert media, "Die Sichtbarkeitsregel @media (pointer: coarse) für .fd-capture fehlt."
+    block = _balanced_block(source, media.end() - 1)
+    assert re.search(r"\.fd-capture\s*\{[^}]*\bdisplay\s*:\s*flex\b", block), (
+        "Innerhalb von @media (pointer: coarse) muss .fd-capture sichtbar werden."
+    )
+
+    default_scope = source[: media.start()] + source[media.end() + len(block) + 1 :]
+    assert re.search(r"\.fd-capture\s*\{[^}]*\bdisplay\s*:\s*none\b", default_scope), (
+        "Ohne primären Touch-Pointer muss .fd-capture per `display: none` unsichtbar bleiben."
+    )
+
+
+def test_capture_handler_resets_input_and_avoids_data_transfer() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    body = _method_body(source, "_onCaptureSelected")
+
+    assert re.search(r"""input\.value\s*=\s*(""|'')""", body), (
+        'Ohne `input.value = ""` feuert `change` für ein zweites Foto gleichen Namens nicht.'
+    )
+    assert not re.search(r"\bDataTransfer\b", _strip_js_comments(body)), (
+        "Kein DataTransfer verwenden: ältere WKWebView-Versionen können daraus "
+        "keine FileList bauen."
+    )
+
+
+def test_capture_microtexts_exist_verbatim() -> None:
+    # Benachbarte String-Literale zusammenziehen, damit Zeilenumbrüche im Quelltext nicht stören.
+    text = PANEL_PATH.read_text(encoding="utf-8").replace("${MAX_IMAGES}", "10")
+    text = re.sub(r'"\s*\+\s*"', "", text)
+
+    missing = [item for item in _CAPTURE_MICROTEXTS if item not in text]
+    assert not missing, f"Mikrotexte fehlen oder weichen ab: {missing}"

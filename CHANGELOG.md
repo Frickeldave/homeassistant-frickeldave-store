@@ -21,6 +21,13 @@ Versionierung nach [SemVer](https://semver.org/lang/de/).
   Bildliste liefert zusätzlich `mtime_ns` und `animated`. PNG und statisches
   GIF bleiben verlustfrei; JPEG/WebP werden neu kodiert (dokumentierte
   Toleranz nach zwei Drehungen: mittlere Abweichung ≤ 2/255 je Farbkanal).
+- **Foto aufnehmen im Bilder-Tab (#321).** Bei gespeicherten Produkten gibt es
+  neben „Bilder hochladen“ die Schaltfläche „Foto aufnehmen“, die auf dem
+  Mobilgerät direkt die Kamera öffnet (`capture="environment"`). Ein Foto wird
+  als JPEG hochgeladen und durchläuft dieselbe Prüfung wie ein Galerie-Upload;
+  HEIC/HEIF wird mit einer deutschen Meldung abgelehnt. Die Schaltfläche
+  erscheint nur bei primärem Touch-Pointer (`pointer: coarse`), im
+  Desktop-Browser bleibt der Bilder-Tab unverändert.
 - **Bildgrenze konfigurierbar (#289).** `settings.images.max_bytes` legt fest,
   ab welcher Dateigröße ein Bild als „zu groß“ gilt (Standard 500 KiB, erlaubt
   sind 50 KiB bis 10 MiB). `GET /api/frickeldave_store/settings` liefert den

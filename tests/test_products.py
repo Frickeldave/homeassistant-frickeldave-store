@@ -27,7 +27,7 @@ from custom_components.frickeldave_store.products import (
     product_matches,
     sort_products,
 )
-from custom_components.frickeldave_store.store import CatalogStore
+from custom_components.frickeldave_store.store import MAX_IMAGE_BYTES, CatalogStore
 
 
 async def _service(tmp_path: Path) -> tuple[CatalogStore, ProductService]:
@@ -638,6 +638,50 @@ async def test_upload_rejects_undecodable_image(tmp_path: Path) -> None:
         )
 
     assert err.value.code == "image_invalid"
+    assert await store.images.async_list(product.article_number) == []
+    assert (await service.async_get(product.article_number)).images == []
+
+
+@pytest.mark.parametrize("content_type", ["image/heic", "image/heif", "application/pdf"])
+async def test_upload_rejects_unsupported_content_type(tmp_path: Path, content_type: str) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    await service.async_add_image(
+        product.article_number,
+        filename="bild.jpg",
+        content_type="image/jpeg",
+        data=jpeg_bytes((64, 48)),
+    )
+    before = await store.images.async_list(product.article_number)
+
+    with pytest.raises(ValidationError) as err:
+        await service.async_add_image(
+            product.article_number,
+            filename="foto.heic",
+            content_type=content_type,
+            data=jpeg_bytes((64, 48)),
+        )
+
+    assert err.value.code == "unsupported_media_type"
+    assert err.value.message == "Nur JPEG, PNG, WebP und GIF werden unterstützt."
+    assert await store.images.async_list(product.article_number) == before
+    assert len((await service.async_get(product.article_number)).images) == 1
+
+
+async def test_upload_rejects_file_above_hard_limit(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+
+    with pytest.raises(ValidationError) as err:
+        await service.async_add_image(
+            product.article_number,
+            filename="kamera.jpg",
+            content_type="image/jpeg",
+            data=b"\x00" * (MAX_IMAGE_BYTES + 1),
+        )
+
+    assert err.value.code == "file_too_large"
+    assert err.value.message == "Das Bild ist größer als 10 MB."
     assert await store.images.async_list(product.article_number) == []
     assert (await service.async_get(product.article_number)).images == []
 

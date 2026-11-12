@@ -1546,6 +1546,7 @@ export class FrickeldaveStorePanel extends LitElement {
       imagesBusy: false,
       imagesError: "",
       imagesNotice: "",
+      imagesCaptureNotice: "",
       imagesPendingDelete: null,
       imagesUploadResults: [],
       imagesOptimizeBusy: false,
@@ -1608,6 +1609,7 @@ export class FrickeldaveStorePanel extends LitElement {
       imagesBusy: false,
       imagesError: "",
       imagesNotice: "",
+      imagesCaptureNotice: "",
       imagesPendingDelete: null,
       imagesUploadResults: [],
       imagesOptimizeBusy: false,
@@ -2343,6 +2345,69 @@ export class FrickeldaveStorePanel extends LitElement {
         });
       }
     }
+  }
+
+  _openCapture() {
+    const editor = this._editor;
+    if (!editor || editor.mode !== "edit" || this._imageBusy()) {
+      return;
+    }
+    const unavailable =
+      "Kamera nicht verfügbar. Bitte die Kamera-Berechtigung der Home-Assistant-App in den " +
+      "Systemeinstellungen prüfen.";
+    const input = this.renderRoot?.querySelector("#fd-image-capture");
+    if (!input) {
+      this._patchEditor({ imagesCaptureNotice: "", imagesError: unavailable });
+      return;
+    }
+    this._patchEditor({ imagesCaptureNotice: "", imagesError: "" });
+    try {
+      input.click();
+    } catch {
+      this._patchEditor({ imagesError: unavailable });
+    }
+  }
+
+  async _onCaptureSelected(event) {
+    const input = event.target;
+    const file = input?.files?.[0] ?? null;
+    if (input) {
+      // Ohne den Reset feuert `change` bei gleichem Dateinamen kein zweites Mal.
+      input.value = "";
+    }
+    const editor = this._editor;
+    if (!editor || editor.mode !== "edit" || this._imageBusy()) {
+      return;
+    }
+    if (!file) {
+      this._patchEditor({ imagesCaptureNotice: "Es wurde kein Foto aufgenommen." });
+      return;
+    }
+    const type = typeof file.type === "string" ? file.type.toLowerCase() : "";
+    const name = typeof file.name === "string" ? file.name : "";
+    if (type.startsWith("image/heic") || type.startsWith("image/heif") || /\.(heic|heif)$/i.test(name)) {
+      this._patchEditor({
+        imagesCaptureNotice: "",
+        imagesError:
+          "Dieses Bildformat wird nicht unterstützt. Bitte ein Foto aufnehmen oder als JPEG hochladen.",
+      });
+      return;
+    }
+    this._patchEditor({ imagesCaptureNotice: "", imagesError: "" });
+    // Kein DataTransfer: ältere WKWebView-Versionen können daraus keine FileList bauen.
+    const normalized = new File([file], name || "aufnahme.jpg", {
+      type: "image/jpeg",
+      lastModified: Number.isFinite(file.lastModified) ? file.lastModified : Date.now(),
+    });
+    await this._onImagesSelected({ target: { files: [normalized], value: "" } });
+  }
+
+  _onCaptureCancelled() {
+    const editor = this._editor;
+    if (!editor || editor.mode !== "edit") {
+      return;
+    }
+    this._patchEditor({ imagesCaptureNotice: "Es wurde kein Foto aufgenommen." });
   }
 
   async _moveImage(index, delta) {
@@ -4671,6 +4736,30 @@ export class FrickeldaveStorePanel extends LitElement {
             ? "Die maximale Anzahl ist erreicht. Bitte zuerst ein Bild löschen."
             : "Mehrere Dateien möglich. Ein Upload über die Höchstzahl wird ohne Teilübernahme abgelehnt."}
         </p>
+        <div class="fd-capture">
+          <input
+            id="fd-image-capture"
+            class="fd-sr-only"
+            type="file"
+            accept="image/jpeg,image/png,image/webp,image/gif"
+            capture="environment"
+            ?disabled=${busy || images.length >= MAX_IMAGES}
+            @change=${(event) => this._onCaptureSelected(event)}
+            @cancel=${() => this._onCaptureCancelled()}
+          />
+          <button
+            type="button"
+            class="fd-button fd-button--primary"
+            ?disabled=${busy || images.length >= MAX_IMAGES}
+            @click=${() => this._openCapture()}
+          >
+            Foto aufnehmen
+          </button>
+          <p class="fd-hint">Ein Foto pro Aufnahme, bis zu ${MAX_IMAGES} Bilder je Produkt.</p>
+          ${editor.imagesCaptureNotice
+            ? html`<p class="fd-hint" role="status">${editor.imagesCaptureNotice}</p>`
+            : ""}
+        </div>
         ${editor.imagesBusy
           ? html`<p class="fd-hint" role="status">
               <span class="fd-spinner" aria-hidden="true"></span> Bilder werden übertragen …
@@ -7375,6 +7464,19 @@ export class FrickeldaveStorePanel extends LitElement {
       display: flex;
       flex-direction: column;
       gap: 6px;
+    }
+
+    /* Aufnahmekontrolle nur auf Geräten mit primärem Touch-Pointer (Companion-App). */
+    .fd-capture {
+      display: none;
+    }
+
+    @media (pointer: coarse) {
+      .fd-capture {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
     }
 
     .fd-image-grid {
