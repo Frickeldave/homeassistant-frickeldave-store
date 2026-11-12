@@ -50,6 +50,17 @@ const CAMERA_MAX_EDGE = 1600;
 const CAMERA_UNAVAILABLE_TEXT =
   "Kamera nicht verfügbar. Bitte die Kamera-Berechtigung der Home-Assistant-App in den " +
   "Systemeinstellungen prüfen.";
+const CAMERA_PERMISSION_TEXT =
+  "Kamera-Zugriff wurde verweigert. Bitte die Kamera-Berechtigung der Home-Assistant-App in den " +
+  "Systemeinstellungen erlauben und erneut versuchen.";
+// Über eine http-Adresse ist die Seite kein sicherer Kontext: `navigator.mediaDevices` fehlt.
+const CAPTURE_INSECURE_TEXT =
+  "Kamera nur über eine https-Verbindung. Über die lokale http-Adresse öffnet Android die " +
+  "Galerie — nutze die Home-Assistant-Cloud oder eine https-Adresse als interne URL.";
+// Sicherer Kontext, aber der WebView bringt kein `getUserMedia` mit.
+const CAPTURE_UNSUPPORTED_TEXT =
+  "Dieser Browser bietet keine Kameravorschau (getUserMedia). Bitte die Home-Assistant-App " +
+  "aktualisieren oder das Foto über die Galerie auswählen.";
 const CAMERA_CANCELLED_TEXT = "Es wurde kein Foto aufgenommen.";
 const CAPTURE_FORMAT_TEXT =
   "Dieses Bildformat wird nicht unterstützt. Bitte ein Foto aufnehmen oder als JPEG hochladen.";
@@ -2382,13 +2393,27 @@ export class FrickeldaveStorePanel extends LitElement {
       return;
     }
     this._patchEditor({ imagesCaptureNotice: "", imagesError: "" });
-    const media = globalThis.navigator?.mediaDevices;
-    if (!media || typeof media.getUserMedia !== "function") {
-      // Ohne getUserMedia (z. B. unsicherer Kontext) ist der `capture`-Hinweis die letzte Chance.
+    if (this._captureState() !== "camera") {
+      // Ohne getUserMedia bleibt nur der Datei-Input des Hosts. Warum die Kamera fehlt,
+      // steht dauerhaft als Hinweis im Block; ein zweiter Text wäre nur Wiederholung.
       this._openCaptureInput("");
       return;
     }
     this._startCamera();
+  }
+
+  /**
+   * Warum die Panel-Kamera verfügbar ist oder nicht.
+   *
+   * `isSecureContext === false` ist die belastbare Auskunft über eine http-Adresse.
+   * Fehlt `getUserMedia` trotz sicherem Kontext, fehlt die Browser-Fähigkeit selbst.
+   */
+  _captureState() {
+    if (globalThis.isSecureContext === false) {
+      return "insecure";
+    }
+    const media = globalThis.navigator?.mediaDevices;
+    return typeof media?.getUserMedia === "function" ? "camera" : "unsupported";
   }
 
   async _startCamera() {
@@ -2399,21 +2424,23 @@ export class FrickeldaveStorePanel extends LitElement {
       .catch(() => {});
 
     let stream = null;
+    let denied = false;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: "environment" } },
         audio: false,
       });
-    } catch {
+    } catch (error) {
       stream = null;
+      denied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
     }
 
     if (!stream) {
       // Kamera verweigert oder nicht vorhanden: der Datei-Input bleibt als Rückfallweg,
-      // der Hinweis erklärt, warum die Kamera nicht geöffnet wurde.
+      // der Hinweis nennt den konkreten Grund.
       this._detachCameraKeydown();
       this._camera = null;
-      this._openCaptureInput(CAMERA_UNAVAILABLE_TEXT);
+      this._openCaptureInput(denied ? CAMERA_PERMISSION_TEXT : CAMERA_UNAVAILABLE_TEXT);
       return;
     }
     if (!this._camera || !this.isConnected) {
@@ -4869,6 +4896,13 @@ export class FrickeldaveStorePanel extends LitElement {
     }
     const busy = this._imageBusy();
     const images = Array.isArray(editor.images) ? editor.images : [];
+    const captureState = this._captureState();
+    const cameraReady = captureState === "camera";
+    const captureHint = captureState === "insecure"
+      ? CAPTURE_INSECURE_TEXT
+      : captureState === "unsupported"
+        ? CAPTURE_UNSUPPORTED_TEXT
+        : "";
     const productLabel = editor.name || editor.articleNumber || "Produkt";
     const oversizedCount = this._oversizedCount(images);
     const uploadResults = Array.isArray(editor.imagesUploadResults) ? editor.imagesUploadResults : [];
@@ -4988,11 +5022,19 @@ export class FrickeldaveStorePanel extends LitElement {
             type="button"
             class="fd-button fd-button--primary"
             ?disabled=${busy || images.length >= MAX_IMAGES}
+            aria-describedby=${cameraReady ? null : "fd-capture-state-hint"}
             @click=${() => this._openCapture()}
           >
-            Foto aufnehmen
+            ${cameraReady ? "Foto aufnehmen" : "Bild auswählen"}
           </button>
           <p class="fd-hint">Ein Foto pro Aufnahme, bis zu ${MAX_IMAGES} Bilder je Produkt.</p>
+          ${captureHint
+            ? html`<p
+                id="fd-capture-state-hint"
+                class="fd-hint fd-hint--warning"
+                role="note"
+              >${captureHint}</p>`
+            : ""}
           ${editor.imagesCaptureNotice
             ? html`<p class="fd-hint" role="status">${editor.imagesCaptureNotice}</p>`
             : ""}
@@ -6688,6 +6730,10 @@ export class FrickeldaveStorePanel extends LitElement {
       margin: 0;
       color: var(--fd-text-muted);
       font-size: var(--fd-font-small);
+    }
+
+    .fd-hint--warning {
+      color: var(--fd-warning);
     }
 
     .fd-small {

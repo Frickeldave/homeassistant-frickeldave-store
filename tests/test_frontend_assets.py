@@ -125,11 +125,18 @@ def _capture_input_element(source: str) -> str:
 #: Mikrotexte aus der Spezifikation. ``${MAX_IMAGES}`` wird zur Laufzeit zu ``10``.
 _CAPTURE_MICROTEXTS = [
     "Foto aufnehmen",
+    "Bild auswählen",
     "Ein Foto pro Aufnahme, bis zu 10 Bilder je Produkt.",
     "Die maximale Anzahl ist erreicht. Bitte zuerst ein Bild löschen.",
     "Es wurde kein Foto aufgenommen.",
     "Kamera nicht verfügbar. Bitte die Kamera-Berechtigung der Home-Assistant-App in den "
     "Systemeinstellungen prüfen.",
+    "Kamera-Zugriff wurde verweigert. Bitte die Kamera-Berechtigung der Home-Assistant-App in den "
+    "Systemeinstellungen erlauben und erneut versuchen.",
+    "Kamera nur über eine https-Verbindung. Über die lokale http-Adresse öffnet Android die "
+    "Galerie — nutze die Home-Assistant-Cloud oder eine https-Adresse als interne URL.",
+    "Dieser Browser bietet keine Kameravorschau (getUserMedia). Bitte die Home-Assistant-App "
+    "aktualisieren oder das Foto über die Galerie auswählen.",
     "Dieses Bildformat wird nicht unterstützt. Bitte ein Foto aufnehmen oder als JPEG hochladen.",
 ]
 
@@ -261,8 +268,12 @@ def test_camera_capture_keeps_the_capture_file_input_fallback() -> None:
     source = PANEL_PATH.read_text(encoding="utf-8")
     open_capture = _method_body(source, "_openCapture")
     fallback = _method_body(source, "_openCaptureInput")
+    state = _method_body(source, "_captureState")
 
-    assert "getUserMedia" in open_capture and "_startCamera(" in open_capture
+    assert "_captureState(" in open_capture and "_startCamera(" in open_capture
+    assert re.search(r"getUserMedia", state), (
+        "Die Zustandserkennung muss die Kamera-Fähigkeit an getUserMedia festmachen."
+    )
     assert "_openCaptureInput(" in _method_body(source, "_startCamera"), (
         "Scheitert getUserMedia, muss der capture-Input als Rückfallweg dienen."
     )
@@ -270,6 +281,72 @@ def test_camera_capture_keeps_the_capture_file_input_fallback() -> None:
     assert re.search(r"\.\s*click\s*\(\s*\)", fallback)
     assert "CAMERA_UNAVAILABLE_TEXT" in fallback, (
         "Auch der Rückfallweg braucht die deutsche Meldung, wenn er nicht öffnet."
+    )
+
+
+def test_capture_distinguishes_insecure_unsupported_and_denied() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    state = _method_body(source, "_captureState")
+
+    assert re.search(r"isSecureContext\s*===\s*false", state), (
+        "Ein unsicherer Kontext muss an isSecureContext erkannt werden, "
+        "nicht am fehlenden API-Objekt."
+    )
+    assert re.search(r"""return\s+["']insecure["']""", state)
+    assert re.search(r"""["']camera["']""", state) and re.search(
+        r"""["']unsupported["']""", state
+    ), "Ein sicherer Kontext ohne getUserMedia ist ein anderer Zustand als ein unsicherer."
+
+    open_capture = _method_body(source, "_openCapture")
+    assert "_captureState()" in open_capture, (
+        "Der Klickpfad muss dieselbe Zustandserkennung verwenden wie der sichtbare Hinweis."
+    )
+
+    # Verweigerte Berechtigung: eigener Text statt der generischen Nicht-verfügbar-Meldung.
+    start = _method_body(source, "_startCamera")
+    catch_block = re.search(r"catch\s*\([^)]*\)\s*\{", start)
+    assert catch_block, "getUserMedia braucht einen catch-Zweig für die verweigerte Berechtigung."
+    catch_body = _balanced_block(start, catch_block.end() - 1)
+    assert re.search(r"NotAllowedError", catch_body), (
+        "Eine abgelehnte Berechtigung (NotAllowedError) muss getrennt behandelt werden."
+    )
+    assert "CAMERA_PERMISSION_TEXT" in start and "CAMERA_UNAVAILABLE_TEXT" in start, (
+        "Verweigerte Berechtigung und fehlende Kamera brauchen unterschiedliche Texte."
+    )
+
+
+def test_insecure_context_hint_is_shown_proactively_in_the_capture_block() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    render = _method_body(source, "_renderEditorImages")
+
+    assert re.search(r"const\s+captureState\s*=\s*this\._captureState\(\)", render), (
+        "Der Hinweis muss beim Rendern berechnet werden, nicht erst nach einem Tipp."
+    )
+    assert "CAPTURE_INSECURE_TEXT" in render and "CAPTURE_UNSUPPORTED_TEXT" in render
+
+    # Der Hinweis steht im .fd-capture-Block und hängt nicht am Ergebnis eines Klicks
+    # (editor.imagesCaptureNotice, das _openCaptureInput erst nach dem Tipp setzt).
+    start = render.index('<div class="fd-capture">')
+    block = render[start : render.index("editor.imagesCaptureNotice", start)]
+    assert 'id="fd-capture-state-hint"' in block
+    assert 'role="note"' in block
+    assert "${captureHint}" in block, (
+        "Der sichtbare Hinweis muss aus captureState kommen, nicht aus imagesCaptureNotice."
+    )
+
+
+def test_capture_button_is_relabelled_when_the_camera_is_unavailable() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    render = _method_body(source, "_renderEditorImages")
+    start = render.index('<div class="fd-capture">')
+    block = render[start : render.index("editor.imagesCaptureNotice", start)]
+
+    assert re.search(r'cameraReady \? "Foto aufnehmen" : "Bild auswählen"', block), (
+        "Über http öffnet die Schaltfläche den Host-Picker; die Beschriftung darf keine "
+        "Kamera versprechen."
+    )
+    assert not re.search(r"\?disabled=\$\{[^}]*cameraReady", block), (
+        "Die Schaltfläche bleibt nutzbar: der Host-Picker ist über http der einzige Weg."
     )
 
 

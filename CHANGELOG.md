@@ -66,6 +66,15 @@ Versionierung nach [SemVer](https://semver.org/lang/de/).
 
 ### Fixed
 
+- **Ehrlicher Kamera-Hinweis über http (#321).** Ist das Panel über eine
+  lokale `http`-Adresse erreichbar (z. B. interne URL `http://ha.home.net`), ist
+  die Seite kein sicherer Kontext; der Browser stellt `navigator.mediaDevices`
+  nicht bereit und Android öffnet über den Datei-Input die Galerie. Das Panel
+  nennt die Ursache jetzt dauerhaft im Bilder-Tab („Kamera nur über eine
+  https-Verbindung …“), beschriftet die Schaltfläche dort als „Bild auswählen“
+  und unterscheidet den fehlenden sicheren Kontext von einem WebView ohne
+  `getUserMedia` sowie von einer verweigerten Kamera-Berechtigung. Über https
+  bleibt die Aufnahme mit Vorschau, „Auslösen“ und „Abbrechen“ unverändert.
 - **„Foto aufnehmen“ öffnet auf Android wieder die Kamera statt der Galerie (#321).**
   In der Home-Assistant-Companion-App (Fairphone und Motorola) zeigte die
   Schaltfläche „Foto aufnehmen“ denselben Datei-/Galerie-Dialog wie „Bilder
