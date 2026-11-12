@@ -70,6 +70,8 @@ STATUS_BY_CODE: dict[str, int] = {
     "unsupported_media_type": 415,
     "file_too_large": 413,
     "image_invalid": 400,
+    "image_animated": 409,
+    "image_write_failed": 500,
     "pillow_missing": 500,
     "not_found": 404,
     "conflict": 409,
@@ -461,6 +463,28 @@ class ImagesView(HomeAssistantView):
                 data=data,
             )
             return web.json_response(result, status=201)
+        except StoreError as err:
+            return _error_response(err)
+
+
+class ImageRotateView(HomeAssistantView):
+    """Ein Bild um 90° nach links oder rechts drehen (destruktiv, Issue #322)."""
+
+    name = "api:frickeldave_store:image_rotate"
+    url = f"{API_PREFIX}/products/{{article_number}}/images/{{name}}/rotate"
+    requires_auth = True
+
+    async def post(self, request: web.Request, article_number: str, name: str) -> web.Response:
+        try:
+            runtime, _ = _authorize(request, ROLE_PRODUCT)
+            payload = await _json_body(request)
+            direction = payload.get("direction")
+            if direction not in {"left", "right"}:
+                raise ValidationError("direction muss 'left' oder 'right' sein.")
+            result = await runtime.products.async_rotate_image(
+                article_number, name, direction=direction
+            )
+            return web.json_response(result)
         except StoreError as err:
             return _error_response(err)
 
@@ -938,6 +962,8 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     ImagesView,
     # statischer Pfad vor ``/images/{name}``
     ImagesOptimizeView,
+    # längere Route vor ``/images/{name}`` registrieren
+    ImageRotateView,
     ImageFileView,
     ImageOrderView,
     ImageMainView,

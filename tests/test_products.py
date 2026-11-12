@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from string import ascii_uppercase
 
 import pytest
-from image_helpers import jpeg_bytes, png_bytes
+from image_helpers import gif_bytes, jpeg_bytes, png_bytes, webp_bytes
 
 import custom_components.frickeldave_store.products as products_module
+from custom_components.frickeldave_store import imaging
 from custom_components.frickeldave_store.models import (
     MAX_IMAGES,
     Image,
@@ -776,3 +778,280 @@ async def test_optimize_images_continues_after_broken_file(tmp_path: Path) -> No
     assert result["results"][1]["resized"] is True
     assert result["summary"]["count"] == 2
     assert await store.images.async_list(article) == ["LA0001-01.jpg", "LA0001-02.jpg"]
+
+
+# --- Issue #322: Bilder drehen -------------------------------------------------
+
+
+async def _seed_images(
+    store: CatalogStore, product: Product, files: list[tuple[str, bytes, bool]]
+) -> None:
+    for name, data, _ in files:
+        await store.images.async_write(product.article_number, name, data)
+    stored = store.get_product(product.article_number)
+    stored.images = [Image(name=name, is_main=is_main) for name, _, is_main in files]
+    store.put_product(stored)
+    await store.async_save()
+    imaging.metadata_cache().clear()
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+async def test_rotate_image_swaps_dimensions_and_keeps_list_metadata(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    files = [
+        (f"{article}-01.jpg", jpeg_bytes((800, 600), quality=80), False),
+        (f"{article}-02.png", png_bytes((400, 300)), True),
+        (f"{article}-03.webp", webp_bytes((320, 240)), False),
+    ]
+    await _seed_images(store, product, files)
+    before = await service.async_list_images(article)
+
+    rotated = await service.async_rotate_image(article, f"{article}-02.png", direction="right")
+
+    result = rotated["result"]
+    assert result["name"] == f"{article}-02.png"
+    assert result["direction"] == "right"
+    assert result["degrees"] == 90
+    assert result["before"] == {
+        "bytes": len(files[1][1]),
+        "width": 400,
+        "height": 300,
+        "content_type": "image/png",
+        "oversized": False,
+    }
+    assert result["after"]["width"] == 300 and result["after"]["height"] == 400
+    assert result["message"] == "Bild um 90° im Uhrzeigersinn gedreht (400×300 → 300×400)."
+
+    images = rotated["images"]
+    assert [item["name"] for item in images] == [name for name, _, _ in files]
+    assert len(images) == 3
+    assert sum(1 for item in images if item["is_main"]) == 1
+    target = images[1]
+    assert target["is_main"] is True
+    assert target["name"].endswith(".png")
+    assert target["content_type"] == "image/png"
+    assert (target["width"], target["height"]) == (300, 400)
+    assert target["bytes"] == result["after"]["bytes"] != before[1]["bytes"]
+    assert target["mtime_ns"] != before[1]["mtime_ns"]
+    assert (images[0]["width"], images[0]["height"]) == (800, 600)
+    assert images[0]["bytes"] == before[0]["bytes"]
+
+
+async def test_rotate_image_keeps_ten_image_limit(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    await _seed_images(
+        store,
+        product,
+        [(f"{article}-{index:02d}.jpg", jpeg_bytes((120, 80)), index == 0) for index in range(10)],
+    )
+
+    rotated = await service.async_rotate_image(article, f"{article}-07.jpg", direction="left")
+
+    assert len(rotated["images"]) == MAX_IMAGES
+    with pytest.raises(ImageLimitError) as err:
+        await service.async_add_image(
+            article,
+            filename="elf.jpg",
+            content_type="image/jpeg",
+            data=jpeg_bytes((64, 48)),
+        )
+    assert err.value.code == "image_limit"
+
+
+async def test_rotate_image_backs_up_original_and_metadata_snapshot(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    original = jpeg_bytes((640, 480), quality=80)
+    name = f"{article}-01.jpg"
+    await _seed_images(store, product, [(name, original, True)])
+
+    await service.async_rotate_image(article, name, direction="right")
+
+    backups = sorted((tmp_path / "backups" / "images" / article).iterdir())
+    assert len(backups) == 1
+    assert backups[0].name.endswith(f"-{name}")
+    assert backups[0].read_bytes() == original
+    snapshots = list((tmp_path / "backups").glob("*-pre-image-rotate.json"))
+    assert len(snapshots) == 1
+
+
+async def test_second_rotation_keeps_the_true_original_backup(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    original = jpeg_bytes((640, 480), quality=80)
+    name = f"{article}-01.jpg"
+    await _seed_images(store, product, [(name, original, True)])
+
+    await service.async_rotate_image(article, name, direction="right")
+    await service.async_rotate_image(article, name, direction="right")
+
+    backups = sorted((tmp_path / "backups" / "images" / article).iterdir())
+    assert len(backups) == 2
+    assert backups[0].read_bytes() == original
+    assert backups[1].read_bytes() != original
+    restored = await service.async_list_images(article)
+    assert (restored[0]["width"], restored[0]["height"]) == (640, 480)
+
+
+async def test_rotate_animated_gif_leaves_the_file_untouched(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    name = f"{article}-01.gif"
+    data = gif_bytes((120, 90), frames=3)
+    await _seed_images(store, product, [(name, data, True)])
+
+    with pytest.raises(ValidationError) as err:
+        await service.async_rotate_image(article, name, direction="right")
+
+    assert err.value.code == "image_animated"
+    assert err.value.message == imaging.ANIMATED_ROTATE_MESSAGE
+    assert _digest(await store.images.async_read(article, name)) == _digest(data)
+    assert not (tmp_path / "backups" / "images" / article).exists()
+
+
+async def test_rotate_corrupt_file_leaves_the_original_byte_identical(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    name = f"{article}-01.jpg"
+    data = b"\xff\xd8keinbild"
+    await _seed_images(store, product, [(name, data, True)])
+
+    with pytest.raises(ValidationError) as err:
+        await service.async_rotate_image(article, name, direction="left")
+
+    assert err.value.code == "image_invalid"
+    assert _digest(await store.images.async_read(article, name)) == _digest(data)
+
+
+async def test_rotate_rejects_unknown_name_and_invalid_direction(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    name = f"{article}-01.jpg"
+    data = jpeg_bytes((320, 240))
+    await _seed_images(store, product, [(name, data, True)])
+
+    with pytest.raises(NotFoundError) as missing:
+        await service.async_rotate_image(article, f"{article}-09.jpg", direction="right")
+    with pytest.raises(ValidationError) as invalid:
+        await service.async_rotate_image(article, name, direction="upward")
+
+    assert missing.value.code == "not_found"
+    assert invalid.value.code == "validation_error"
+    assert invalid.value.message == imaging.ROTATE_DIRECTION_MESSAGE
+    assert _digest(await store.images.async_read(article, name)) == _digest(data)
+
+
+async def test_rotate_read_failure_keeps_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    name = f"{article}-01.jpg"
+    data = jpeg_bytes((320, 240))
+    await _seed_images(store, product, [(name, data, True)])
+    real_read_bytes = Path.read_bytes
+
+    def failing_read_bytes(self: Path) -> bytes:
+        if self.name == name:
+            raise OSError("Lesefehler")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
+
+    with pytest.raises(ValidationError) as err:
+        await service.async_rotate_image(article, name, direction="right")
+
+    assert err.value.code == "image_write_failed"
+    assert err.value.message == products_module.IMAGE_ROTATE_WRITE_FAILED_MESSAGE
+    monkeypatch.undo()
+    assert _digest(await store.images.async_read(article, name)) == _digest(data)
+
+
+async def test_manual_restore_from_backup_restores_original_metadata(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    original = jpeg_bytes((640, 480), quality=80)
+    name = f"{article}-01.jpg"
+    await _seed_images(store, product, [(name, original, True)])
+    before = await service.async_list_images(article)
+
+    await service.async_rotate_image(article, name, direction="right")
+    backup = next((tmp_path / "backups" / "images" / article).iterdir())
+    await store.images.async_write(article, name, backup.read_bytes())
+    imaging.metadata_cache().clear()
+
+    restored = await service.async_list_images(article)
+    assert (restored[0]["width"], restored[0]["height"]) == (640, 480)
+    assert restored[0]["bytes"] == before[0]["bytes"]
+    assert (await store.images.async_read(article, name)) == original
+
+
+async def test_rotate_recomputes_oversized_with_the_configured_limit(tmp_path: Path) -> None:
+    store, service = await _service(tmp_path)
+    store.update_settings({"images": {"max_bytes": 50 * 1024}})
+    product = await _create(service)
+    article = product.article_number
+    name = f"{article}-01.jpg"
+    # Lange Kante klein, Datei durch Altbestand-Padding über der eingestellten Grenze.
+    data = jpeg_bytes((400, 300), quality=80) + b"\x00" * (52 * 1024)
+    await _seed_images(store, product, [(name, data, True)])
+
+    rotated = await service.async_rotate_image(article, name, direction="right")
+
+    assert rotated["result"]["before"]["oversized"] is True
+    assert rotated["result"]["after"]["bytes"] < 50 * 1024
+    assert rotated["result"]["after"]["oversized"] is False
+    assert rotated["images"][0]["oversized"] is False
+
+
+async def test_rotate_pixel_limit_leaves_the_original_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    name = f"{article}-01.png"
+    data = png_bytes((400, 300))
+    await _seed_images(store, product, [(name, data, True)])
+    monkeypatch.setattr(imaging, "MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(ValidationError) as err:
+        await service.async_rotate_image(article, name, direction="right")
+
+    assert err.value.code == "image_invalid"
+    assert await store.images.async_read(article, name) == data
+
+
+async def test_failed_store_save_restores_the_original_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, service = await _service(tmp_path)
+    product = await _create(service)
+    article = product.article_number
+    name = f"{article}-01.jpg"
+    original = jpeg_bytes((640, 480), quality=80)
+    await _seed_images(store, product, [(name, original, True)])
+
+    async def failing_save(*args: object, **kwargs: object) -> None:
+        raise OSError("Speichern fehlgeschlagen")
+
+    monkeypatch.setattr(store, "async_save", failing_save)
+
+    with pytest.raises(OSError):
+        await service.async_rotate_image(article, name, direction="right")
+
+    assert await store.images.async_read(article, name) == original

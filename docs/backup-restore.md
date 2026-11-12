@@ -37,6 +37,7 @@ Der Datenordner enthält immer **Store-Datei, Bilder und Snapshots gemeinsam**:
 | Metadaten | `frickeldave_store.data` |
 | Bilder | `images/<artikelnummer>/<artikelnummer>-NN.jpg` |
 | Snapshots | `backups/` |
+| Original-Sicherungen gedrehter Bilder | `backups/images/<artikelnummer>/` |
 
 Bei `data_path = config` sind das die bisherigen Pfade
 `config/frickeldave_store/...`. Eine Sicherung nur der JSON-Datei verliert die
@@ -107,6 +108,14 @@ Stichprobenbilder im Panel stimmen.
   Fehler aus Issue #289 (Katalog wurde leer geladen und überschrieben).
 - `async_migrate_entry` legt zusätzlich
   `<Datenordner>/backups/<zeitstempel>-pre-entry-migration-v<n>.json` an.
+- Vor einer Bilddrehung entstehen zwei Sicherungen: die pixelgenaue
+  Original-Sicherung der Bilddatei unter
+  `<Datenordner>/backups/images/<artikelnummer>/<zeitstempel>-<dateiname>` und
+  der Metadaten-Snapshot
+  `<Datenordner>/backups/<zeitstempel>-pre-image-rotate.json`. Die
+  Original-Sicherung enthält die Bilddatei im Ausgangsformat; eine Drehung
+  konvertiert nicht, anders als der Upload (PNG ohne Transparenz wird dort zu
+  JPEG, PNG/WebP mit Transparenz zu WebP).
 - Snapshots werden nicht automatisch gelöscht; bei Bedarf manuell aufräumen.
   Wiederholte `pre-save`-Snapshots mit identischem Inhalt werden nicht dupliziert.
 
@@ -155,12 +164,46 @@ ersetzen:
    beim Laden und legt vorher erneut einen Snapshot an.
 7. Ist der Bildordner `images/` ebenfalls beschädigt, den passenden
    `images`-Ordner aus dem HA-Backup daneben entpacken — die JSON-Snapshots
-   enthalten nur die Bild-Metadaten, nicht die Bilddateien.
+   enthalten nur die Bild-Metadaten, nicht die Bilddateien. Ausnahmen sind die
+   Original-Sicherungen nach einer Drehung unter `backups/images/`; sie
+   enthalten echte Bilddateien, aber immer nur ein einzelnes Bild je Drehung.
 
 > Hinweis: `pre-save`-Snapshots entstehen vor dem ersten Schreiben nach dem
 > Laden. Bei einem Update, das den Katalog leer angezeigt hat, ist genau dieser
 > Snapshot der letzte vollständige Stand — solange danach kein weiterer
 > Schreibvorgang mit leerem Inhalt erfolgt ist.
+
+### Nach einer Bilddrehung
+
+Eine Drehung lässt sich im Panel nicht rückgängig machen. Die Original-Sicherung
+unter `<Datenordner>/backups/images/` enthält die Pixel vor der Drehung und den
+ursprünglichen Dateinamen samt Endung:
+
+1. Home Assistant stoppen (Container), damit während des Kopierens nicht
+   geschrieben wird.
+2. Sicherung suchen und den aktuellen Stand beiseitelegen:
+   ```bash
+   cd config/frickeldave_store
+   ls -1t backups/images/LA0001/*-LA0001-03.jpg
+   cp frickeldave_store.data "frickeldave_store.data.vor-restore-$(date +%F-%H%M)"
+   cp images/LA0001/LA0001-03.jpg "images/LA0001/LA0001-03.jpg.vor-restore-$(date +%F-%H%M)"
+   ```
+3. Das Original an seinen alten Platz kopieren. Die Sicherung behält die Endung
+   der Bilddatei und stellt den Zeitstempel voran:
+   ```bash
+   cp backups/images/LA0001/<zeitstempel>-LA0001-03.jpg images/LA0001/LA0001-03.jpg
+   ```
+4. Optional die Metadaten zurückspielen, etwa wenn Bildliste, Reihenfolge oder
+   Hauptbild nicht mehr stimmen:
+   ```bash
+   cp backups/<zeitstempel>-pre-image-rotate.json frickeldave_store.data
+   ```
+5. Home Assistant starten und das Bild im Panel prüfen. `bytes`, `width`,
+   `height` und `oversized` berechnet die Integration beim Lesen neu.
+
+Die Sicherungen zählen zu `backups_bytes` in `storage.usage` und werden nicht
+automatisch gelöscht. Nach erfolgreicher Prüfung lassen sie sich entfernen; für
+einen späteren Vergleich ist ein Aufbewahrungsfenster sinnvoll.
 
 ### Aus einem Home-Assistant-Backup
 

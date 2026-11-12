@@ -129,7 +129,11 @@ fehlt eine Datei, bleiben Integration und API vollständig funktionsfähig.
 Der Bilder-Tab im Produktdialog zeigt je Bild Maße und Dateigröße, warnt vor zu
 großen Bildern und fasst sie über „Bilder optimieren“ zusammen. Produkte mit
 mindestens einem zu großen Bild tragen in Liste und Kachel ein Warndreieck, das
-den Dialog direkt im Bilder-Tab öffnet.
+den Dialog direkt im Bilder-Tab öffnet. Jede Bildkarte trägt zusätzlich die
+Schaltflächen **↺ 90°** (nach links, gegen den Uhrzeigersinn) und **↻ 90°** (nach
+rechts, im Uhrzeigersinn); die Vorschau aktualisiert sich sofort, ohne die Seite
+neu zu laden. Die Schaltflächen stehen im Bearbeitungsmodus bereit, beim Anlegen
+noch nicht, und sind bei animierten GIF- und WebP-Dateien deaktiviert.
 
 ## Daten, Speicherort und Backup
 
@@ -142,6 +146,7 @@ die Auswahl mit einer klaren Meldung fehl.
 | Metadaten (JSON) | `config/frickeldave_store/frickeldave_store.data` |
 | Bilder | `config/frickeldave_store/images/<artikelnummer>/<artikelnummer>-NN.jpg` |
 | Snapshots vor Migration | `config/frickeldave_store/backups/` |
+| Original-Sicherungen gedrehter Bilder | `config/frickeldave_store/backups/images/<artikelnummer>/` |
 | Export (konfigurierbar) | `config/frickeldave_store/export/public/data/handmade.json` und `src/assets/handmade/` |
 
 Bei `share` bzw. `media` liegt derselbe Aufbau unter
@@ -295,6 +300,7 @@ Fehlerformat: `{"error": {"code": "...", "message": "..."}}`.
 | POST | `/products/{article_number}/archive` |
 | GET, POST | `/products/{article_number}/images` |
 | GET, DELETE | `/products/{article_number}/images/{name}` |
+| POST | `/products/{article_number}/images/{name}/rotate` (`product`; Bild um 90° drehen) |
 | POST | `/products/{article_number}/images/order` |
 | POST | `/products/{article_number}/images/main` |
 | POST | `/products/{article_number}/images/optimize` (`product`; Bestandsbilder verkleinern) |
@@ -384,10 +390,11 @@ Die Antwort enthält zusätzlich zu `images`:
 ```
 
 `GET /products/{article_number}/images`, die Produktliste und das Produktdetail
-liefern je Bild `bytes`, `width`, `height`, `content_type` und `oversized`
-(`true`, wenn die lange Kante > 1600 px **oder** die Datei größer als
-`settings.images.max_bytes` ist; Standard 500 KiB). Die Werte werden beim Lesen aus
-den Dateien ermittelt und nicht im Store gespeichert.
+liefern je Bild `bytes`, `width`, `height`, `content_type`, `oversized`,
+`mtime_ns` und `animated`. `oversized` ist `true`, wenn die lange Kante >
+1600 px **oder** die Datei größer als `settings.images.max_bytes` ist (Standard
+500 KiB); `animated` ist `true` bei animiertem GIF oder WebP. Die Werte werden
+beim Lesen aus den Dateien ermittelt und nicht im Store gespeichert.
 
 `POST /products/{article_number}/images/optimize` verkleinert alle zu großen
 Bilder eines Produkts nach denselben Regeln, behält Reihenfolge und Hauptbild und
@@ -411,6 +418,50 @@ entsteht ein Snapshot der Metadaten (`backups/*-pre-image-optimize.json`).
 
 Fehler einzelner Bilder brechen den Lauf nicht ab; sie erscheinen mit `error`
 und `resized: false`, die übrigen Bilder werden weiter verarbeitet.
+
+### Drehen um 90°
+
+`POST /products/{article_number}/images/{name}/rotate` erwartet
+`{"direction": "left"}` (nach links, gegen den Uhrzeigersinn) oder
+`{"direction": "right"}` (nach rechts, im Uhrzeigersinn). Vor dem Überschreiben
+entsteht eine pixelgenaue Original-Sicherung der Bilddatei unter
+`backups/images/<artikelnummer>/<zeitstempel>-<dateiname>`; zusätzlich legt der
+Store den Metadaten-Snapshot `backups/*-pre-image-rotate.json` an.
+
+Die Antwort führt unter `images` die aktualisierte Bildliste und unter `result`
+den Zustand vor und nach der Drehung:
+
+```json
+{
+  "result": {
+    "name": "LA0001-01.jpg",
+    "direction": "left",
+    "degrees": -90,
+    "before": {"bytes": 285000, "width": 1600, "height": 1200,
+               "content_type": "image/jpeg", "oversized": false},
+    "after": {"bytes": 279000, "width": 1200, "height": 1600,
+              "content_type": "image/jpeg", "oversized": false},
+    "message": "Bild um 90° gegen den Uhrzeigersinn gedreht (1600×1200 → 1200×1600)."
+  }
+}
+```
+
+Formate: JPEG bleibt JPEG (Qualität 82, progressiv), WebP bleibt WebP (Qualität
+85, Alpha erhalten), PNG bleibt verlustfrei mit Alpha, ein statisches GIF bleibt
+GIF; EXIF- und ICC-Daten fallen in allen Formaten weg. Die EXIF-Orientierung
+wird vor dem Drehen angewendet. Animierte GIF- und WebP-Dateien lehnt die Route
+mit `409 image_animated` ab und lässt sie unverändert. Bilder aus dem Altbestand
+über 1600 px werden auf die lange Kante 1600 px verkleinert (nie hochskaliert);
+`oversized` wird neu berechnet.
+
+Nach einer Drehung sind JPEG und WebP nicht mehr byteidentisch zum Ausgangsbild.
+PNG bleibt pixelidentisch, die mittlere Abweichung je Farbkanal liegt bei
+höchstens 2 von 255.
+
+Fehler: `400 validation_error` (ungültige Richtung oder ungültiger Bildname),
+`404 not_found` (Produkt oder Bild fehlt), `409 image_animated`,
+`400 image_invalid`, `500 pillow_missing`, `500 image_write_failed`,
+`401 not_authenticated`, `403 forbidden`.
 
 WebSocket-Kommandos: `frickeldave_store/me`, `frickeldave_store/products`,
 `frickeldave_store/subscribe`.

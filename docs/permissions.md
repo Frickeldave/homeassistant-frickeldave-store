@@ -37,6 +37,7 @@ Rollen sind beliebig kombinierbar.
 | `/api/frickeldave_store/products/{article_number}/archive` | POST | `product` |
 | `/api/frickeldave_store/products/{article_number}/images` | GET, POST | `product` |
 | `/api/frickeldave_store/products/{article_number}/images/{name}` | GET, DELETE | `product` |
+| `/api/frickeldave_store/products/{article_number}/images/{name}/rotate` | POST | `product` |
 | `/api/frickeldave_store/products/{article_number}/images/order` | POST | `product` |
 | `/api/frickeldave_store/products/{article_number}/images/main` | POST | `product` |
 | `/api/frickeldave_store/products/{article_number}/stock` | GET, POST | `product` |
@@ -51,6 +52,11 @@ Rollen sind beliebig kombinierbar.
 | `frickeldave_store/me` | WS | nur Anmeldung |
 | `frickeldave_store/products` | WS | `product` |
 | `frickeldave_store/subscribe` | WS | `product` (bei jedem Push erneut geprüft) |
+
+Die Bild-Routen einschließlich `.../images/{name}/rotate` verlangen dieselbe Rolle
+`product` wie alle übrigen Produktendpunkte. `401` und `403` verhalten sich dort
+unverändert: eine fehlende oder abgelaufene Sitzung ergibt `401 not_authenticated`,
+eine fehlende Produktrolle `403 forbidden` – ohne Bilddaten im Body.
 
 ## Freigaben verwalten
 

@@ -22,6 +22,12 @@ Lesen aus den Dateien ermittelt und prozesslokal gecacht. Der Cache ist nach
 Pfad, ``mtime`` und Größe geschlüsselt, damit geänderte Dateien automatisch neu
 gelesen werden, und durch :data:`METADATA_CACHE_SIZE` begrenzt, damit er bei
 großen Katalogen nicht unbegrenzt wächst.
+
+Seit Issue #322 lassen sich vorhandene Bilder um 90° drehen
+(:func:`rotate_image_sync`). Gedreht wird immer auf Basis der **sichtbaren**
+Ausrichtung (``ImageOps.exif_transpose`` zuerst), das Format und die
+Dateiendung bleiben erhalten. Animierte GIF- und WebP-Dateien werden
+abgelehnt, weil eine Drehung einzelne Frames unbrauchbar machen würde.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-from .models import ValidationError
+from .models import ImageSizeDict, ValidationError
 
 #: Lange Kante des Ergebnisses in Pixeln.
 MAX_LONG_EDGE: Final = 1600
@@ -49,6 +55,24 @@ WEBP_QUALITY: Final = 85
 MAX_IMAGE_PIXELS: Final = 40_000_000
 #: Obergrenze des Metadaten-Caches (Anzahl Dateien).
 METADATA_CACHE_SIZE: Final = 4096
+
+#: Drehrichtungen der Bilddrehung (Issue #322).
+ROTATE_LEFT: Final = "left"
+ROTATE_RIGHT: Final = "right"
+ROTATE_DIRECTIONS: Final[tuple[str, ...]] = (ROTATE_LEFT, ROTATE_RIGHT)
+#: Gradzahl je Richtung; negativ = gegen den Uhrzeigersinn.
+ROTATE_DEGREES: Final[dict[str, int]] = {ROTATE_LEFT: -90, ROTATE_RIGHT: 90}
+ROTATE_DIRECTION_MESSAGE: Final = "direction muss 'left' oder 'right' sein."
+ANIMATED_ROTATE_MESSAGE: Final = (
+    "Animierte GIF- und WebP-Bilder können nicht gedreht werden. Die Datei bleibt unverändert."
+)
+
+CONTENT_TYPE_BY_IMAGE_FORMAT: Final[dict[str, str]] = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+    "GIF": "image/gif",
+}
 
 CONTENT_TYPE_BY_SUFFIX: Final[dict[str, str]] = {
     ".jpg": "image/jpeg",
@@ -128,6 +152,8 @@ class ImageInfo:
     height: int | None
     content_type: str
     oversized: bool
+    mtime_ns: int | None = None
+    animated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +162,8 @@ class ImageInfo:
             "height": self.height,
             "content_type": self.content_type,
             "oversized": self.oversized,
+            "mtime_ns": self.mtime_ns,
+            "animated": self.animated,
         }
 
 
@@ -169,6 +197,44 @@ class OptimizeResult:
             "width": self.width,
             "height": self.height,
             "content_type": self.content_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RotateResult:
+    """Ergebnis einer 90°-Drehung inklusive Maßen vorher/nachher (Issue #322)."""
+
+    data: bytes
+    content_type: str
+    direction: str
+    degrees: int
+    width: int
+    height: int
+    original_bytes: int
+    original_width: int
+    original_height: int
+    original_content_type: str
+    original_oversized: bool
+    oversized: bool
+    downscaled: bool
+    message: str
+
+    def before_payload(self) -> ImageSizeDict:
+        return {
+            "bytes": self.original_bytes,
+            "width": self.original_width,
+            "height": self.original_height,
+            "content_type": self.original_content_type,
+            "oversized": self.original_oversized,
+        }
+
+    def after_payload(self) -> ImageSizeDict:
+        return {
+            "bytes": len(self.data),
+            "width": self.width,
+            "height": self.height,
+            "content_type": self.content_type,
+            "oversized": self.oversized,
         }
 
 
@@ -388,31 +454,212 @@ async def async_optimize_image(
     return await asyncio.to_thread(optimize_image_sync, data, content_type, max_bytes)
 
 
+def _pillow_imageops() -> Any:
+    """``ImageOps`` bei Bedarf importieren (``exif_transpose``)."""
+
+    try:
+        from PIL import ImageOps  # noqa: PLC0415 - absichtlich lazy
+    except ImportError as err:  # pragma: no cover - Pillow ist Core-Abhängigkeit
+        raise ValidationError(_MISSING_PILLOW, code="pillow_missing") from err
+    return ImageOps
+
+
+def _encode_rotated(image: Any, image_format: str, transparency: Any) -> bytes:
+    """Gedrehtes Bild im Ausgangsformat kodieren; EXIF/ICC werden verworfen."""
+
+    image_mod = pillow()
+    has_alpha = _has_alpha(image)
+    buffer = io.BytesIO()
+    image.info.clear()
+    if image_format == "JPEG":
+        target = image if image.mode in {"RGB", "L"} else image.convert("RGB")
+        target.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True, progressive=True)
+    elif image_format == "WEBP":
+        if image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGBA" if has_alpha else "RGB")
+        image.save(buffer, format="WEBP", quality=WEBP_QUALITY, method=4)
+    elif image_format == "PNG":
+        # Palettenbilder verlieren ihre Transparenz beim Neukodieren nicht:
+        # vorher nach RGBA (mit Alpha) bzw. RGB (ohne) wandeln.
+        if image.mode not in {"RGB", "RGBA", "L", "LA", "1"}:
+            image = image.convert("RGBA" if has_alpha else "RGB")
+        image.save(buffer, format="PNG", optimize=True)
+    else:  # GIF: statisch, Ausgangsformat bleibt GIF
+        target = (
+            image
+            if image.mode in {"P", "L", "1"}
+            else image.convert("P", palette=image_mod.Palette.ADAPTIVE)
+        )
+        if transparency is not None and target.mode == "P":
+            target.save(buffer, format="GIF", transparency=transparency)
+        else:
+            target.save(buffer, format="GIF")
+    return buffer.getvalue()
+
+
+def rotate_image_sync(
+    data: bytes,
+    *,
+    direction: str,
+    content_type: str,
+    max_bytes: int = MAX_IMAGE_BYTES,
+) -> RotateResult:
+    """Rohbytes synchron um 90° drehen; Aufruf gehört in einen Executor.
+
+    Gedreht wird auf Basis der sichtbaren Ausrichtung (EXIF-Orientierung wird
+    zuerst angewendet). Das Format bleibt erhalten; übergroße Altbestände
+    (lange Kante > 1600 px) werden auf 1600 px verkleinert, nie vergrößert.
+    PNG und statisches GIF bleiben verlustfrei; JPEG (Qualität 82) und WebP
+    (Qualität 85) werden neu kodiert – dokumentierte Toleranz nach zwei
+    Drehungen: mittlere Abweichung ≤ 2/255 je Farbkanal.
+    """
+
+    if direction not in ROTATE_DIRECTIONS:
+        raise ValidationError(ROTATE_DIRECTION_MESSAGE, code="validation_error")
+    image_mod = pillow()
+    image_ops = _pillow_imageops()
+    requested_type = (content_type or "").casefold()
+    if requested_type == "image/jpg":
+        requested_type = "image/jpeg"
+    original_bytes = len(data)
+    if not data:
+        raise _invalid("Die Datei ist leer.")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", image_mod.DecompressionBombWarning)
+            with image_mod.open(io.BytesIO(data)) as source:
+                width, height = source.size
+                if width * height > MAX_IMAGE_PIXELS:
+                    raise _invalid(
+                        f"Das Bild ist mit {width}×{height} Pixeln zu groß "
+                        f"(Grenze: {MAX_IMAGE_PIXELS // 1_000_000} Megapixel)."
+                    )
+                image_format = (source.format or "").upper()
+                animated = bool(getattr(source, "is_animated", False)) or (
+                    int(getattr(source, "n_frames", 1) or 1) > 1
+                )
+                if animated and image_format in {"GIF", "WEBP"}:
+                    raise ValidationError(ANIMATED_ROTATE_MESSAGE, code="image_animated")
+                if image_format not in CONTENT_TYPE_BY_IMAGE_FORMAT:
+                    raise _invalid("Die Datei ist kein lesbares Bild oder beschädigt.")
+                source.load()
+                # Sichtbare Ausrichtung ist die Basis der Drehung (Issue #322).
+                visible = image_ops.exif_transpose(source)
+                transparency = (visible.info or {}).get("transparency")
+                original_width, original_height = visible.size
+                transpose = (
+                    image_mod.Transpose.ROTATE_270
+                    if direction == ROTATE_RIGHT
+                    else image_mod.Transpose.ROTATE_90
+                )
+                rotated = visible.transpose(transpose)
+                downscaled = False
+                if max(rotated.size) > MAX_LONG_EDGE:
+                    if rotated.mode == "P":
+                        rotated = rotated.convert("RGBA" if transparency is not None else "RGB")
+                    rotated.thumbnail((MAX_LONG_EDGE, MAX_LONG_EDGE), image_mod.Resampling.LANCZOS)
+                    downscaled = True
+                encoded = _encode_rotated(rotated, image_format, transparency)
+                new_width, new_height = rotated.size
+    except ValidationError:
+        raise
+    except (image_mod.DecompressionBombError, image_mod.DecompressionBombWarning) as err:
+        raise _invalid(f"Das Bild überschreitet die zulässige Pixelmenge ({err}).") from err
+    except (
+        image_mod.UnidentifiedImageError,
+        OSError,
+        ValueError,
+        SyntaxError,
+        KeyError,
+        EOFError,
+    ) as err:
+        raise _invalid("Die Datei ist kein lesbares Bild oder beschädigt.") from err
+
+    format_type = CONTENT_TYPE_BY_IMAGE_FORMAT[image_format]
+    result_type = (
+        requested_type if requested_type in CONTENT_TYPE_BY_IMAGE_FORMAT.values() else format_type
+    )
+    label = "im Uhrzeigersinn" if direction == ROTATE_RIGHT else "gegen den Uhrzeigersinn"
+    message = (
+        f"Bild um 90° {label} gedreht "
+        f"({original_width}×{original_height} → {new_width}×{new_height})."
+    )
+    return RotateResult(
+        data=encoded,
+        content_type=result_type,
+        direction=direction,
+        degrees=ROTATE_DEGREES[direction],
+        width=new_width,
+        height=new_height,
+        original_bytes=original_bytes,
+        original_width=original_width,
+        original_height=original_height,
+        original_content_type=result_type,
+        original_oversized=is_oversized(original_width, original_height, original_bytes, max_bytes),
+        oversized=is_oversized(new_width, new_height, len(encoded), max_bytes),
+        downscaled=downscaled,
+        message=message,
+    )
+
+
+async def async_rotate_image(
+    data: bytes,
+    *,
+    direction: str,
+    content_type: str,
+    max_bytes: int = MAX_IMAGE_BYTES,
+) -> RotateResult:
+    """90°-Drehung im Executor, damit der Event-Loop frei bleibt."""
+
+    return await asyncio.to_thread(
+        rotate_image_sync,
+        data,
+        direction=direction,
+        content_type=content_type,
+        max_bytes=max_bytes,
+    )
+
+
 def read_info_sync(path: Path, max_bytes: int = MAX_IMAGE_BYTES) -> ImageInfo:
     """Metadaten einer Datei lesen (nur Header, kein vollständiges Dekodieren)."""
 
     content_type = CONTENT_TYPE_BY_SUFFIX.get(path.suffix.casefold(), "application/octet-stream")
     try:
-        size = path.stat().st_size
+        stat = path.stat()
     except OSError:
         return ImageInfo(
-            bytes=0, width=None, height=None, content_type=content_type, oversized=False
+            bytes=0,
+            width=None,
+            height=None,
+            content_type=content_type,
+            oversized=False,
+            mtime_ns=None,
+            animated=False,
         )
+    size = stat.st_size
     width: int | None = None
     height: int | None = None
+    animated = False
     try:
         image_mod = pillow()
         with image_mod.open(path) as source:
             width, height = source.size
+            animated = bool(getattr(source, "is_animated", False)) or (
+                int(getattr(source, "n_frames", 1) or 1) > 1
+            )
     except Exception:  # noqa: BLE001 - defekte Dateien (oder fehlendes Pillow) brechen die Liste nicht
         width = None
         height = None
+        animated = False
     return ImageInfo(
         bytes=size,
         width=width,
         height=height,
         content_type=content_type,
         oversized=is_oversized(width, height, size, max_bytes),
+        mtime_ns=stat.st_mtime_ns,
+        animated=animated,
     )
 
 
@@ -441,6 +688,14 @@ class MetadataCache:
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+
+    def invalidate(self, path: Path | str) -> None:
+        """Alle Einträge einer Datei verwerfen (z. B. nach dem Überschreiben)."""
+
+        prefix = str(path)
+        with self._lock:
+            for key in [key for key in self._entries if key[0] == prefix]:
+                del self._entries[key]
 
     def __len__(self) -> int:
         with self._lock:
@@ -489,18 +744,26 @@ async def async_inspect_paths(
 
 
 __all__ = [
+    "ANIMATED_ROTATE_MESSAGE",
     "CONTENT_TYPE_BY_SUFFIX",
     "JPEG_QUALITY",
     "MAX_IMAGE_BYTES",
     "MAX_IMAGE_PIXELS",
     "MAX_LONG_EDGE",
     "METADATA_CACHE_SIZE",
+    "ROTATE_DEGREES",
+    "ROTATE_DIRECTIONS",
+    "ROTATE_DIRECTION_MESSAGE",
+    "ROTATE_LEFT",
+    "ROTATE_RIGHT",
     "WEBP_QUALITY",
     "ImageInfo",
     "MetadataCache",
     "OptimizeResult",
+    "RotateResult",
     "async_inspect_paths",
     "async_optimize_image",
+    "async_rotate_image",
     "content_type_for_name",
     "format_bytes",
     "inspect_paths",
@@ -510,5 +773,6 @@ __all__ = [
     "optimize_image_sync",
     "pillow",
     "read_info_sync",
+    "rotate_image_sync",
     "suffix_for_content_type",
 ]

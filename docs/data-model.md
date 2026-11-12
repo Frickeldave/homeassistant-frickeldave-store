@@ -59,6 +59,40 @@ Datei: `config/frickeldave_store/images/<artikelnummer>/<artikelnummer>-NN.jpg`
 Ein elfter Upload wird mit Code `image_limit` und Status `409` abgelehnt; es entsteht
 keine Teilpersistenz (Datei wird erst nach der Prüfung geschrieben).
 
+Die API liefert je Bild die Metadaten aus `ImageInfo`: `bytes`, `width`, `height`,
+`content_type`, `oversized`, `mtime_ns` (Änderungszeit in Nanosekunden; bricht den
+Metadaten-Cache und dient dem Panel als Versionsparameter im Bild-URL) und `animated`
+(`true` bei animiertem GIF oder WebP). Die Werte werden beim Lesen aus der Datei
+ermittelt und nicht im Store gespeichert.
+
+#### Drehen
+
+`POST /products/{article_number}/images/{name}/rotate` mit
+`{"direction": "left" | "right"}` schreibt die Bilddatei neu und erweitert die Antwort
+um `result`:
+
+```json
+{
+  "result": {
+    "name": "LA0001-01.jpg",
+    "direction": "left",
+    "degrees": -90,
+    "before": {"bytes": 285000, "width": 1600, "height": 1200,
+               "content_type": "image/jpeg", "oversized": false},
+    "after": {"bytes": 279000, "width": 1200, "height": 1600,
+              "content_type": "image/jpeg", "oversized": false},
+    "message": "Bild um 90° gegen den Uhrzeigersinn gedreht (1600×1200 → 1200×1600)."
+  }
+}
+```
+
+Vor dem Schreiben kopiert der Store die Originaldatei nach
+`backups/images/<artikelnummer>/<zeitstempel>-<dateiname>` und legt den
+Metadaten-Snapshot `backups/<zeitstempel>-pre-image-rotate.json` an. Beide gehören zum
+Datenordner und zählen zu `storage.usage.backups_bytes`. Dateiname und Position in der
+Bildliste bleiben unverändert; nur `bytes`, `width`, `height`, `mtime_ns` und
+`oversized` ändern sich.
+
 ### Bestandsbuchung
 
 | Feld | Bedeutung |

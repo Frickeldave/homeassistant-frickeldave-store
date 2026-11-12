@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, TypedDict
 
 SCHEMA_VERSION: Final = 2
 CATEGORIES: Final[tuple[str, ...]] = ("3D", "EP", "LA", "SB", "WO")
@@ -397,6 +397,27 @@ class Image:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Image:
         return cls(name=str(data.get("name", "")), is_main=bool(data.get("is_main", False)))
+
+
+class ImageSizeDict(TypedDict):
+    """Größenmetadaten eines Bildes (``before``/``after`` der Drehung)."""
+
+    bytes: int
+    width: int | None
+    height: int | None
+    content_type: str
+    oversized: bool
+
+
+class ImageRotateResultDict(TypedDict):
+    """Antwort von ``POST .../images/{name}/rotate`` (Issue #322)."""
+
+    name: str
+    direction: str
+    degrees: int
+    before: ImageSizeDict
+    after: ImageSizeDict
+    message: str
 
 
 @dataclass(slots=True)

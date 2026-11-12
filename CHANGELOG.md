@@ -8,6 +8,19 @@ Versionierung nach [SemVer](https://semver.org/lang/de/).
 
 ### Added
 
+- **Bilder im Panel drehen (#322).** Jedes Produktbild lässt sich um 90° nach
+  links (gegen den Uhrzeigersinn) oder rechts (im Uhrzeigersinn) drehen –
+  `POST /api/frickeldave_store/products/{article_number}/images/{name}/rotate`
+  mit `{"direction": "left" | "right"}`. Die Drehung ist destruktiv: Vor dem
+  Überschreiben wird die Originaldatei byteweise unter `backups/images/`
+  gesichert und ein Snapshot `pre-image-rotate` der Metadaten angelegt. Format
+  und Dateiendung bleiben erhalten (JPEG, PNG, WebP, statisches GIF); die
+  EXIF-Ausrichtung wird zuerst angewendet, übergroße Altbestände werden auf
+  1600 px verkleinert. Animierte GIF- und WebP-Dateien werden mit
+  `image_animated` (409) abgelehnt, die Datei bleibt unverändert. Die
+  Bildliste liefert zusätzlich `mtime_ns` und `animated`. PNG und statisches
+  GIF bleiben verlustfrei; JPEG/WebP werden neu kodiert (dokumentierte
+  Toleranz nach zwei Drehungen: mittlere Abweichung ≤ 2/255 je Farbkanal).
 - **Bildgrenze konfigurierbar (#289).** `settings.images.max_bytes` legt fest,
   ab welcher Dateigröße ein Bild als „zu groß“ gilt (Standard 500 KiB, erlaubt
   sind 50 KiB bis 10 MiB). `GET /api/frickeldave_store/settings` liefert den
