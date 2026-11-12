@@ -37,6 +37,7 @@ jobs:
           node --check custom_components/frickeldave_store/frontend/frickeldave-store-config-panel.js
           node --check custom_components/frickeldave_store/frontend/publish-filters.js
           node --check custom_components/frickeldave_store/frontend/format-bytes.js
+          node --check custom_components/frickeldave_store/frontend/image-rotate.js
       - name: "Syntax: Lit-Bundle"
         run: node --check custom_components/frickeldave_store/frontend/lit.js
       - name: "Tests: Feature-Gating"
@@ -45,6 +46,8 @@ jobs:
         run: node --test tests/frontend/publish-filters.test.mjs
       - name: "Tests: Größenformat"
         run: node --test tests/frontend/format-bytes.test.mjs
+      - name: "Tests: Bildrotation"
+        run: node --test tests/frontend/image-rotate.test.mjs
 
   typing:
     name: "mypy"

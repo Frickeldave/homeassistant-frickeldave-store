@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
 from .const import API_PREFIX
 from .imaging import (
+    ROTATE_DIRECTION_MESSAGE,
+    ROTATE_DIRECTIONS,
     async_inspect_paths,
     async_optimize_image,
     content_type_for_name,
+    metadata_cache,
     read_info_sync,
+    rotate_image_sync,
 )
 from .models import (
     ARTICLE_NUMBER_LENGTH,
@@ -26,6 +32,7 @@ from .models import (
     ConflictError,
     Image,
     ImageLimitError,
+    ImageRotateResultDict,
     NotFoundError,
     Product,
     StockBooking,
@@ -39,10 +46,19 @@ from .models import (
     validate_create_payload,
     validate_update_payload,
 )
-from .store import ALLOWED_CONTENT_TYPES, MAX_IMAGE_BYTES, CatalogStore
+from .store import ALLOWED_CONTENT_TYPES, MAX_IMAGE_BYTES, CatalogStore, ImageStorage
+
+_LOGGER = logging.getLogger(__name__)
 
 #: Zeichen ohne Verwechslungsgefahr (kein I, O, 0, 1).
 _ARTICLE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+#: Unterordner der Original-Sicherung vor einer Bilddrehung (Issue #322).
+IMAGE_BACKUP_SUBDIR: Final = "images"
+#: Fehlertext bei fehlgeschlagenem Lesen/Schreiben der gedrehten Datei.
+IMAGE_ROTATE_WRITE_FAILED_MESSAGE: Final = (
+    "Das gedrehte Bild konnte nicht gespeichert werden. Die Originaldatei bleibt unverändert."
+)
 
 #: Erlaubte Sortierschlüssel (Panel, HTTP- und WebSocket-API). ``size``
 #: sortiert nach der Summe der Bilddateien (siehe :meth:`ProductService.async_list`).
@@ -813,6 +829,94 @@ class ProductService:
             },
             "images": await self.async_list_images(article_number),
         }
+
+    async def async_rotate_image(
+        self, article_number: str, name: str, *, direction: str
+    ) -> dict[str, Any]:
+        """Bild destruktiv um 90° drehen; die Originaldatei wird vorher gesichert.
+
+        Gelesen und gedreht wird – wie beim Upload – außerhalb der Sperre. Vor
+        dem Überschreiben werden Produkt und Bildname innerhalb der Sperre
+        erneut geprüft, damit kein veralteter Stand geschrieben wird. Die
+        Sicherung der Originaldatei liegt byteweise identisch unter
+        ``backups/images/``; die Metadaten erhält ein Snapshot
+        ``pre-image-rotate`` (analog zur Sammel-Optimierung).
+        """
+
+        if direction not in ROTATE_DIRECTIONS:
+            raise ValidationError(ROTATE_DIRECTION_MESSAGE)
+        async with self._store.lock:
+            product = self._store.get_product(article_number, include_archived=True)
+            _validate_image_name(product, name)
+            path = self._store.images.path_for(product.article_number, name)
+        try:
+            original = await asyncio.to_thread(path.read_bytes)
+        except OSError as err:
+            raise ValidationError(
+                IMAGE_ROTATE_WRITE_FAILED_MESSAGE, code="image_write_failed"
+            ) from err
+        rotated = await asyncio.to_thread(
+            rotate_image_sync,
+            original,
+            direction=direction,
+            content_type=content_type_for_name(name),
+            max_bytes=self._store.image_max_bytes,
+        )
+
+        async with self._store.lock:
+            product = self._store.get_product(article_number, include_archived=True)
+            _validate_image_name(product, name)
+            target = self._store.images.path_for(product.article_number, name)
+            try:
+                await self._async_backup_image(product.article_number, name, original)
+                await self._store.async_snapshot("pre-image-rotate")
+            except OSError as err:
+                # Ohne Sicherung wird nicht überschrieben.
+                raise ValidationError(
+                    IMAGE_ROTATE_WRITE_FAILED_MESSAGE, code="image_write_failed"
+                ) from err
+            try:
+                await self._store.images.async_write(product.article_number, name, rotated.data)
+            except OSError as err:
+                raise ValidationError(
+                    IMAGE_ROTATE_WRITE_FAILED_MESSAGE, code="image_write_failed"
+                ) from err
+            metadata_cache().invalidate(target)
+            try:
+                self._store.put_product(product)
+                await self._store.async_save()
+            except BaseException:
+                try:
+                    await self._store.images.async_write(product.article_number, name, original)
+                except OSError:  # pragma: no cover - Sicherung liegt bereits vor
+                    _LOGGER.exception(
+                        "Originaldatei %s konnte nach fehlgeschlagenem Speichern nicht "
+                        "wiederhergestellt werden",
+                        target,
+                    )
+                metadata_cache().invalidate(target)
+                raise
+        result: ImageRotateResultDict = {
+            "name": name,
+            "direction": direction,
+            "degrees": rotated.degrees,
+            "before": rotated.before_payload(),
+            "after": rotated.after_payload(),
+            "message": rotated.message,
+        }
+        return {
+            "images": await self.async_list_images(article_number),
+            "result": result,
+        }
+
+    async def _async_backup_image(self, article_number: str, name: str, data: bytes) -> Path:
+        """Byteweise identische Kopie der Originaldatei unter ``backups/images/``."""
+
+        # Mikrosekunden, damit zwei Drehungen kurz hintereinander die erste
+        # Sicherung (das echte Original) nicht überschreiben.
+        stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+        backups = ImageStorage(self._store.backup_dir / IMAGE_BACKUP_SUBDIR)
+        return await backups.async_write(article_number, f"{stamp}-{name}", data)
 
     async def async_read_image(self, article_number: str, name: str) -> tuple[Path, str]:
         product = await self.async_get(article_number, include_archived=True)

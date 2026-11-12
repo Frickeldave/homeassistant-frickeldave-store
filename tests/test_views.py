@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
-from image_helpers import jpeg_bytes, png_bytes
+from image_helpers import gif_bytes, image_bytes, jpeg_bytes, png_bytes
 
 from custom_components.frickeldave_store import FrickeldaveStoreRuntime
 from custom_components.frickeldave_store.ai import AIError, AIService
@@ -24,13 +24,19 @@ from custom_components.frickeldave_store.const import (
 from custom_components.frickeldave_store.models import SCHEMA_VERSION, Image
 from custom_components.frickeldave_store.permissions import PermissionManager
 from custom_components.frickeldave_store.products import ProductService
-from custom_components.frickeldave_store.store import MAX_IMAGE_BYTES, CatalogStore
+from custom_components.frickeldave_store.store import (
+    MAX_IMAGE_BYTES,
+    CatalogStore,
+    ImageStorage,
+)
 from custom_components.frickeldave_store.views import (
     VIEWS,
     ArchiveView,
     ArticleNumberView,
     DescriptionSuggestView,
     ExportView,
+    ImageFileView,
+    ImageRotateView,
     ImagesOptimizeView,
     ImagesView,
     LocationsView,
@@ -722,3 +728,213 @@ async def test_optimize_endpoint_resizes_existing_images(tmp_path: Path) -> None
 
     again = _payload(await ImagesOptimizeView().post(FakeRequest(hass, "user-1"), article))
     assert again["results"][0]["resized"] is False
+
+
+# --- Issue #322: Bilder drehen -------------------------------------------------
+
+
+async def _create_with_image(
+    hass: FakeHass,
+    user: str = "user-1",
+    *,
+    image: bytes | None = None,
+    content_type: str = "image/jpeg",
+) -> tuple[str, dict[str, Any]]:
+    """Produkt über die API anlegen und ein Bild hochladen."""
+
+    create = await ProductsView().post(
+        FakeRequest(hass, user, body={"name": "Schild", "category": "LA"})
+    )
+    article = _payload(create)["articleNumber"]
+    suffix = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+    }[content_type]
+    upload = SimpleNamespace(
+        content_type=content_type,
+        filename=f"bild{suffix}",
+        file=io.BytesIO(jpeg_bytes((800, 600), quality=80) if image is None else image),
+    )
+    uploaded = await ImagesView().post(FakeRequest(hass, user, upload=upload), article)
+    return article, _payload(uploaded)["images"][0]
+
+
+async def test_rotate_endpoint_rotates_and_reports_before_and_after(tmp_path: Path) -> None:
+    hass, runtime = await _setup(tmp_path, {"user-1": ["product"]})
+    article, image = await _create_with_image(hass)
+    name = image["name"]
+
+    response = await ImageRotateView().post(
+        FakeRequest(hass, "user-1", body={"direction": "right"}), article, name
+    )
+    body = _payload(response)
+
+    assert response.status == 200
+    assert body["result"]["name"] == name
+    assert body["result"]["direction"] == "right"
+    assert body["result"]["degrees"] == 90
+    assert body["result"]["before"]["width"] == 800
+    assert body["result"]["before"]["height"] == 600
+    assert body["result"]["after"]["width"] == 600
+    assert body["result"]["after"]["height"] == 800
+    assert body["result"]["message"].startswith("Bild um 90° im Uhrzeigersinn gedreht")
+
+    rotated = body["images"][0]
+    assert rotated["name"] == name
+    assert rotated["content_type"] == "image/jpeg"
+    assert (rotated["width"], rotated["height"]) == (600, 800)
+    assert rotated["bytes"] == body["result"]["after"]["bytes"]
+    assert rotated["mtime_ns"] != image["mtime_ns"]
+    assert rotated["is_main"] is True
+
+    stored = await runtime.store.images.async_read(article, name)
+    assert stored == runtime.store.images.path_for(article, name).read_bytes()
+    assert len(stored) == rotated["bytes"]
+
+
+@pytest.mark.parametrize("body", [{}, {"direction": "upward"}, {"direction": "LEFT"}, None])
+async def test_rotate_endpoint_rejects_missing_or_invalid_direction(
+    tmp_path: Path, body: dict[str, Any] | None
+) -> None:
+    hass, runtime = await _setup(tmp_path, {"user-1": ["product"]})
+    article, image = await _create_with_image(hass)
+    before = await runtime.store.images.async_read(article, image["name"])
+
+    response = await ImageRotateView().post(
+        FakeRequest(hass, "user-1", body=body), article, image["name"]
+    )
+
+    assert response.status == 400
+    assert _payload(response)["error"]["code"] == "validation_error"
+    assert await runtime.store.images.async_read(article, image["name"]) == before
+
+
+async def test_rotate_endpoint_requires_session_and_product_role(tmp_path: Path) -> None:
+    hass, runtime = await _setup(
+        tmp_path, {"user-1": ["product"], "gast": ["finance"]}, provider=None
+    )
+    article, image = await _create_with_image(hass)
+    before = await runtime.store.images.async_read(article, image["name"])
+
+    anonymous = await ImageRotateView().post(
+        FakeRequest(hass, None, body={"direction": "right"}), article, image["name"]
+    )
+    denied = await ImageRotateView().post(
+        FakeRequest(hass, "gast", body={"direction": "right"}), article, image["name"]
+    )
+
+    assert anonymous.status == 401
+    assert _payload(anonymous)["error"]["code"] == "not_authenticated"
+    assert denied.status == 403
+    assert _payload(denied)["error"]["code"] == "forbidden"
+    assert await runtime.store.images.async_read(article, image["name"]) == before
+
+
+@pytest.mark.parametrize(
+    ("content_type", "image"),
+    [
+        ("image/gif", gif_bytes((120, 90), frames=3)),
+        ("image/webp", image_bytes("WEBP", (120, 90), "RGB", frames=3)),
+    ],
+)
+async def test_rotate_endpoint_rejects_animated_images_with_409(
+    tmp_path: Path, content_type: str, image: bytes
+) -> None:
+    hass, runtime = await _setup(tmp_path, {"user-1": ["product"]})
+    article, image_payload = await _create_with_image(hass, image=image, content_type=content_type)
+    assert image_payload["animated"] is True
+    before = await runtime.store.images.async_read(article, image_payload["name"])
+
+    response = await ImageRotateView().post(
+        FakeRequest(hass, "user-1", body={"direction": "left"}),
+        article,
+        image_payload["name"],
+    )
+
+    assert response.status == 409
+    assert _payload(response)["error"] == {
+        "code": "image_animated",
+        "message": (
+            "Animierte GIF- und WebP-Bilder können nicht gedreht werden. "
+            "Die Datei bleibt unverändert."
+        ),
+    }
+    assert await runtime.store.images.async_read(article, image_payload["name"]) == before
+
+
+async def test_rotate_endpoint_unknown_image_returns_404(tmp_path: Path) -> None:
+    hass, _ = await _setup(tmp_path, {"user-1": ["product"]})
+    article, _image = await _create_with_image(hass)
+
+    response = await ImageRotateView().post(
+        FakeRequest(hass, "user-1", body={"direction": "right"}), article, "fehlt.jpg"
+    )
+
+    assert response.status == 404
+    assert _payload(response)["error"]["code"] == "not_found"
+
+
+async def test_rotate_endpoint_write_failure_returns_500_and_keeps_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hass, runtime = await _setup(tmp_path, {"user-1": ["product"]})
+    article, image = await _create_with_image(hass)
+    before = await runtime.store.images.async_read(article, image["name"])
+    real_write = ImageStorage.async_write
+
+    async def failing_write(
+        storage: ImageStorage, article_number: str, name: str, data: bytes
+    ) -> Path:
+        if "backups" not in str(storage.base_dir):
+            raise OSError("Datenträger voll")
+        return await real_write(storage, article_number, name, data)
+
+    monkeypatch.setattr(ImageStorage, "async_write", failing_write)
+
+    response = await ImageRotateView().post(
+        FakeRequest(hass, "user-1", body={"direction": "right"}), article, image["name"]
+    )
+
+    assert response.status == 500
+    assert _payload(response)["error"]["code"] == "image_write_failed"
+    assert await runtime.store.images.async_read(article, image["name"]) == before
+
+
+async def test_rotate_endpoint_feeds_the_export_with_the_same_name(tmp_path: Path) -> None:
+    hass, runtime = await _setup(tmp_path, {"user-1": ["product"], "admin": ["app_admin"]})
+    article, image = await _create_with_image(hass)
+    name = image["name"]
+    rotated = await ImageRotateView().post(
+        FakeRequest(hass, "user-1", body={"direction": "left"}), article, name
+    )
+    assert rotated.status == 200
+
+    exported = await ExportView().post(FakeRequest(hass, "admin"))
+
+    assert exported.status == 200
+    target = tmp_path / "export" / "src" / "assets" / "handmade" / "LA" / article / name
+    assert target.is_file()
+    assert target.read_bytes() == await runtime.store.images.async_read(article, name)
+
+
+async def test_rotate_route_resolves_before_the_image_file_route(tmp_path: Path) -> None:
+    hass, _ = await _setup(tmp_path, {"user-1": ["product"]})
+    assert VIEWS.index(ImagesOptimizeView) < VIEWS.index(ImageRotateView)
+    assert VIEWS.index(ImageRotateView) < VIEWS.index(ImageFileView)
+
+    app = web.Application()
+    for view_class in VIEWS:
+        view_class().register(hass, app, app.router)  # type: ignore[arg-type]
+
+    request = make_mocked_request(
+        "POST", f"{API_PREFIX}/products/LA3K3X/images/LA3K3X-01.jpg/rotate", app=app
+    )
+    match = await app.router.resolve(request)
+
+    assert match["article_number"] == "LA3K3X"
+    assert match["name"] == "LA3K3X-01.jpg"
+    assert match.route.resource.canonical == (
+        f"{API_PREFIX}/products/{{article_number}}/images/{{name}}/rotate"
+    )

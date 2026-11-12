@@ -20,6 +20,15 @@ import { authRequestUrl, shouldRefreshToken } from "./auth-retry.js";
 import { featureInfo, normalizeFeatures } from "./features.js";
 import { formatBytes } from "./format-bytes.js";
 import {
+  ROTATE_DIRECTIONS,
+  canRotateImage,
+  normalizeRotateDirection,
+  rotateAriaLabel,
+  rotateButtonLabel,
+  rotateNoticeText,
+  rotateTargetSelector,
+} from "./image-rotate.js";
+import {
   FILE_FILTER_ALL,
   fileStatusCounts,
   filterFileChanges,
@@ -204,6 +213,8 @@ const normalizeImage = (image) => {
       height: 0,
       content_type: "",
       oversized: false,
+      animated: false,
+      mtime_ns: 0,
     };
   }
   if (!image || typeof image !== "object") {
@@ -212,6 +223,7 @@ const normalizeImage = (image) => {
   const bytes = Math.max(0, Math.round(Number(image.bytes) || 0));
   const width = Math.max(0, Math.round(Number(image.width) || 0));
   const height = Math.max(0, Math.round(Number(image.height) || 0));
+  const mtimeNs = Math.max(0, Math.trunc(Number(image.mtime_ns) || 0));
   // Der Server setzt `oversized`; für ältere Antworten wird es aus den Maßen abgeleitet.
   const oversized =
     Boolean(image.oversized) ||
@@ -226,6 +238,9 @@ const normalizeImage = (image) => {
     height,
     content_type: typeof image.content_type === "string" ? image.content_type : "",
     oversized,
+    // Animierte Bilder sind nicht drehbar; `mtime_ns` bricht den Bild-Cache.
+    animated: Boolean(image.animated),
+    mtime_ns: mtimeNs,
   };
 };
 
@@ -1320,15 +1335,29 @@ export class FrickeldaveStorePanel extends LitElement {
     return formatBytes(bytes);
   }
 
+  /**
+   * Der Dateiname bleibt beim Drehen unverändert. Ohne Versionsparameter
+   * liefert der Browser weiterhin die alte Ausrichtung aus dem Cache.
+   */
+  _imageVersionQuery(image) {
+    const mtime = Math.max(0, Math.trunc(Number(image?.mtime_ns) || 0));
+    return mtime > 0 ? `v=${mtime}` : "";
+  }
+
   _imageUrl(product, image) {
     if (!image) {
       return "";
     }
+    const version = this._imageVersionQuery(image);
     if (image.url) {
-      return image.url;
+      if (!version) {
+        return image.url;
+      }
+      return `${image.url}${image.url.includes("?") ? "&" : "?"}${version}`;
     }
     if (image.name && product?.articleNumber) {
-      return `${productPath(product.articleNumber)}/images/${encodeURIComponent(image.name)}`;
+      const url = `${productPath(product.articleNumber)}/images/${encodeURIComponent(image.name)}`;
+      return version ? `${url}?${version}` : url;
     }
     return "";
   }
@@ -1374,6 +1403,8 @@ export class FrickeldaveStorePanel extends LitElement {
       const response = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
         credentials: "same-origin",
+        // Nach dem Drehen darf keine zwischengespeicherte Antwort gewinnen.
+        cache: "no-store",
         signal: controller.signal,
       });
       if (!response.ok) {
@@ -2447,6 +2478,79 @@ export class FrickeldaveStorePanel extends LitElement {
       await this._loadImages(articleNumber);
       if (this._editor) {
         this._patchEditor({ imagesBusy: false, imagesNotice: "Hauptbild gespeichert." });
+      }
+      this._loadProducts();
+    } catch (error) {
+      if (isAbortError(error)) {
+        this._patchEditor({ imagesBusy: false });
+        return;
+      }
+      await this._loadImages(articleNumber);
+      if (this._editor) {
+        this._patchEditor({ imagesBusy: false, imagesError: this._errorText(error) });
+      }
+    }
+  }
+
+  /**
+   * Verwirft die zwischengespeicherten Object-URLs eines Bildes. Der Name bleibt
+   * beim Drehen gleich, deshalb reicht es nicht, nur die neue Version zu laden:
+   * der alte Eintrag würde die alte Ausrichtung weiter anzeigen.
+   */
+  _forgetImage(name) {
+    const suffix = `/images/${encodeURIComponent(name)}`;
+    for (const [url, entry] of [...this._imageCache]) {
+      if (!url.includes(suffix)) {
+        continue;
+      }
+      if (entry.objectUrl) {
+        URL.revokeObjectURL(entry.objectUrl);
+      }
+      this._imageCache.delete(url);
+    }
+    this._imageVersion += 1;
+  }
+
+  /** Nach dem Re-Render zurück zum selben Drehknopf; deaktivierte Knöpfe verlieren den Fokus. */
+  _focusRotateButton(name, direction) {
+    const selector = rotateTargetSelector(name, direction);
+    if (!selector) {
+      return;
+    }
+    this.updateComplete
+      .then(() => this.renderRoot?.querySelector(selector)?.focus?.())
+      .catch(() => {});
+  }
+
+  async _rotateImage(name, direction) {
+    const editor = this._editor;
+    if (!editor || editor.mode !== "edit" || this._imageBusy() || !name) {
+      return;
+    }
+    const rotation = normalizeRotateDirection(direction);
+    const image = editor.images.find((entry) => entry.name === name);
+    if (!rotation || !canRotateImage(image, { mode: editor.mode })) {
+      return;
+    }
+    const articleNumber = editor.articleNumber;
+    this._patchEditor({
+      imagesBusy: true,
+      imagesError: "",
+      imagesNotice: "",
+      imagesPendingDelete: null,
+    });
+
+    try {
+      await this._api(
+        `${productPath(articleNumber)}/images/${encodeURIComponent(name)}/rotate`,
+        { method: "POST", body: { direction: rotation } },
+      );
+      // Erst den alten Cache verwerfen, dann die Metadaten (neue `mtime_ns`) laden.
+      this._forgetImage(name);
+      await this._loadImages(articleNumber);
+      if (this._editor) {
+        this._patchEditor({ imagesBusy: false, imagesNotice: rotateNoticeText(rotation) });
+        this._focusRotateButton(name, rotation);
       }
       this._loadProducts();
     } catch (error) {
@@ -4681,6 +4785,8 @@ export class FrickeldaveStorePanel extends LitElement {
           const state = this._imageState(this._imageUrl({ articleNumber: editor.articleNumber }, image));
           const src = state.src;
           const meta = formatImageMeta(image);
+          // Drehen nur im Bearbeitungsmodus, ohne laufende Aktion und nicht bei animierten Bildern.
+          const canRotate = canRotateImage(image, { mode: editor.mode, busy });
           return html`
             <li class="fd-image-card">
               <div class="fd-image-preview">
@@ -4744,6 +4850,22 @@ export class FrickeldaveStorePanel extends LitElement {
                 >
                   Als Hauptbild
                 </button>
+                ${ROTATE_DIRECTIONS.map(
+                  (direction) => html`<button
+                    type="button"
+                    class="fd-button fd-button--small fd-image-rotate"
+                    data-image=${image.name}
+                    data-direction=${direction}
+                    @click=${() => this._rotateImage(image.name, direction)}
+                    ?disabled=${busy || !canRotate}
+                    aria-label=${rotateAriaLabel(index + 1, direction)}
+                    title=${image.animated
+                      ? "Animierte Bilder lassen sich nicht drehen."
+                      : rotateAriaLabel(index + 1, direction)}
+                  >
+                    ${rotateButtonLabel(direction)}
+                  </button>`,
+                )}
                 <button
                   type="button"
                   class="fd-button fd-button--small fd-button--danger"
@@ -7417,6 +7539,14 @@ export class FrickeldaveStorePanel extends LitElement {
       display: flex;
       flex-wrap: wrap;
       gap: 4px;
+    }
+
+    /* Sechs Aktionen je Karte: kurze Labels, Umbruch in drei Reihen, Ziele ab 48 px. */
+    .fd-image-actions .fd-button {
+      flex: 1 1 auto;
+      min-width: 48px;
+      min-height: 48px;
+      white-space: nowrap;
     }
 
     .fd-image-toolbar {
