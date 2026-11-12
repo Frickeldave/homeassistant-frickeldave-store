@@ -134,25 +134,39 @@ _CAPTURE_MICROTEXTS = [
 ]
 
 
-def _balanced_block(source: str, open_index: int) -> str:
-    """Inhalt zwischen ``source[open_index]`` (``{``) und der zugehörigen ``}``."""
+def _balanced_span(source: str, open_index: int) -> int:
+    """Index der schließenden Klammer zu ``source[open_index]`` (``{``, ``(`` oder ``[``)."""
 
+    closer_of = {"{": "}", "(": ")", "[": "]"}
+    opener = source[open_index]
+    closer = closer_of.get(opener)
+    assert closer, f"Kein Klammer-Auftakt an Position {open_index}."
     depth = 0
     for index in range(open_index, len(source)):
         char = source[index]
-        if char == "{":
+        if char == opener:
             depth += 1
-        elif char == "}":
+        elif char == closer:
             depth -= 1
             if depth == 0:
-                return source[open_index + 1 : index]
+                return index
     raise AssertionError("Unbalancierte Klammern im Panel-Quelltext.")
 
 
+def _balanced_block(source: str, open_index: int) -> str:
+    """Inhalt zwischen ``source[open_index]`` (``{``) und der zugehörigen ``}``."""
+
+    return source[open_index + 1 : _balanced_span(source, open_index)]
+
+
 def _method_body(source: str, name: str) -> str:
-    match = re.search(rf"\b{name}\s*\([^)]*\)\s*\{{", source)
+    """Rumpf der Methode ``name`` — Parameter dürfen Objekt-Destrukturierung enthalten."""
+
+    match = re.search(rf"^[ \t]*(?:async\s+)?{name}\s*\(", source, re.MULTILINE)
     assert match, f"Methode {name} fehlt im Panel-Quelltext."
-    return _balanced_block(source, match.end() - 1)
+    body_start = source.find("{", _balanced_span(source, match.end() - 1))
+    assert body_start != -1, f"Methode {name} hat keinen Rumpf."
+    return _balanced_block(source, body_start)
 
 
 def _strip_js_comments(code: str) -> str:
@@ -209,3 +223,75 @@ def test_capture_microtexts_exist_verbatim() -> None:
 
     missing = [item for item in _CAPTURE_MICROTEXTS if item not in text]
     assert not missing, f"Mikrotexte fehlen oder weichen ab: {missing}"
+
+
+def test_camera_capture_uses_get_user_media_with_rear_camera() -> None:
+    body = _method_body(PANEL_PATH.read_text(encoding="utf-8"), "_startCamera")
+
+    assert re.search(r"getUserMedia\s*\(", body), (
+        "Die Aufnahme darf nicht allein am capture-Hinweis des Datei-Inputs hängen: "
+        "Android-WebView-Hosts ignorieren ihn und öffnen die Galerie."
+    )
+    assert re.search(r"""facingMode\s*:\s*\{\s*ideal\s*:\s*["']environment["']""", body), (
+        "getUserMedia muss die rückseitige Kamera bevorzugen."
+    )
+    assert re.search(r"\baudio\s*:\s*false\b", body), (
+        "Für ein Foto darf kein Mikrofon geöffnet werden."
+    )
+
+
+def test_camera_stream_is_stopped_on_close_cancel_and_disconnect() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    stop = _method_body(source, "_stopCameraStream")
+
+    assert re.search(r"getTracks\s*\(", stop), "Der Stream muss über seine Tracks beendet werden."
+    assert re.search(r"stop\s*(?:\?\.)?\s*\(\s*\)", stop), "Jeder Track braucht ein stop()."
+
+    assert "_stopCameraStream" in _method_body(source, "_closeCamera")
+    assert "_closeCamera" in _method_body(source, "_takePhoto")
+    assert "_stopCameraStream" in _method_body(source, "disconnectedCallback"), (
+        "Beim Entfernen des Panels darf die Kamera nicht weiterlaufen."
+    )
+    assert re.search(r"_closeCamera\(\s*\{\s*cancelled\s*:\s*true", source), (
+        "Abbrechen muss den Stream beenden und die Abbruch-Meldung zeigen."
+    )
+
+
+def test_camera_capture_keeps_the_capture_file_input_fallback() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    open_capture = _method_body(source, "_openCapture")
+    fallback = _method_body(source, "_openCaptureInput")
+
+    assert "getUserMedia" in open_capture and "_startCamera(" in open_capture
+    assert "_openCaptureInput(" in _method_body(source, "_startCamera"), (
+        "Scheitert getUserMedia, muss der capture-Input als Rückfallweg dienen."
+    )
+    assert re.search(r"""querySelector\(\s*["']#fd-image-capture["']\s*\)""", fallback)
+    assert re.search(r"\.\s*click\s*\(\s*\)", fallback)
+    assert "CAMERA_UNAVAILABLE_TEXT" in fallback, (
+        "Auch der Rückfallweg braucht die deutsche Meldung, wenn er nicht öffnet."
+    )
+
+
+def test_camera_overlay_previews_and_uploads_jpeg_through_the_existing_path() -> None:
+    source = PANEL_PATH.read_text(encoding="utf-8")
+    overlay = _method_body(source, "_renderCameraOverlay")
+
+    assert "_renderCameraOverlay" in _method_body(source, "_renderEditorDialog"), (
+        "Das Overlay muss im Produktdialog liegen, sonst verdeckt der modale Dialog es."
+    )
+    assert "<video" in overlay and "fd-camera-preview" in overlay
+    assert re.search(r"\bautoplay\b", overlay) and re.search(r"\bplaysinline\b", overlay)
+    assert "Auslösen" in overlay and "Abbrechen" in overlay
+
+    take_photo = _method_body(source, "_takePhoto")
+    assert re.search(r"toBlob\s*\(", take_photo), (
+        "Das Videobild wird über ein Canvas als JPEG erzeugt."
+    )
+    assert re.search(r"""["']image/jpeg["']""", take_photo)
+
+    captured = _method_body(source, "_onPhotoCaptured")
+    assert "new File(" in captured
+    assert "_onImagesSelected" in captured, (
+        "Das Foto muss durch den bestehenden Uploadweg (Limit, Busy-Lock, POST) laufen."
+    )

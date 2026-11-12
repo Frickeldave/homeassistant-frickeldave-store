@@ -35,6 +35,16 @@ const REQUEST_TIMEOUT_MS = 30000;
 // Der Katalogimport lädt Produkte und Bilder von der Website und darf länger laufen.
 const IMPORT_TIMEOUT_MS = 180000;
 
+// Kamera-Aufnahme im Panel: Android-WebView-Hosts ignorieren den `capture`-Hinweis
+// am Datei-Input, deshalb wird das Foto über getUserMedia im Panel aufgenommen.
+const CAMERA_MAX_EDGE = 1600;
+const CAMERA_UNAVAILABLE_TEXT =
+  "Kamera nicht verfügbar. Bitte die Kamera-Berechtigung der Home-Assistant-App in den " +
+  "Systemeinstellungen prüfen.";
+const CAMERA_CANCELLED_TEXT = "Es wurde kein Foto aufgenommen.";
+const CAPTURE_FORMAT_TEXT =
+  "Dieses Bildformat wird nicht unterstützt. Bitte ein Foto aufnehmen oder als JPEG hochladen.";
+
 // Event der Basis, sobald sich registrierte Erweiterungen ändern (Contract 1).
 const FEATURES_EVENT = "frickeldave_store_features_changed";
 // Fehler der generischen Feature-Route: deuten auf einen veralteten Stand hin.
@@ -396,6 +406,7 @@ export class FrickeldaveStorePanel extends LitElement {
     _locationsError: { state: true },
 
     _editor: { state: true },
+    _camera: { state: true },
     _archiveDialog: { state: true },
     _tagsDialog: { state: true },
     _importDialog: { state: true },
@@ -456,6 +467,8 @@ export class FrickeldaveStorePanel extends LitElement {
     this._locationsError = "";
 
     this._editor = null;
+    this._camera = null;
+    this._cameraStream = null;
     this._archiveDialog = null;
     this._tagsDialog = null;
     this._importDialog = null;
@@ -475,6 +488,7 @@ export class FrickeldaveStorePanel extends LitElement {
     // Gebundene Listener für das Kontextmenü (document-Ebene).
     this._onMenuOutside = (event) => this._handleMenuOutside(event);
     this._onMenuKeydown = (event) => this._handleMenuKeydown(event);
+    this._onCameraKeydown = (event) => this._handleCameraKeydown(event);
   }
 
   get hass() {
@@ -510,6 +524,9 @@ export class FrickeldaveStorePanel extends LitElement {
   disconnectedCallback() {
     super.disconnectedCallback();
     document.removeEventListener("visibilitychange", this._onVisibilityChange);
+    this._stopCameraStream();
+    this._camera = null;
+    this._detachCameraKeydown();
     this._detachMenuListeners();
     this._unsubscribeFeatureEvents();
     clearTimeout(this._featuresTimer);
@@ -938,6 +955,9 @@ export class FrickeldaveStorePanel extends LitElement {
     this._allTags = [];
     this._menuOpen = false;
     this._detachMenuListeners();
+    this._stopCameraStream();
+    this._camera = null;
+    this._detachCameraKeydown();
     this._editor = null;
     this._archiveDialog = null;
     this._tagsDialog = null;
@@ -1708,6 +1728,7 @@ export class FrickeldaveStorePanel extends LitElement {
     }
     clearTimeout(this._editorShakeTimer);
     this._editorSnapshot = "";
+    this._closeCamera();
     this._articlePreviewRequestId += 1;
     this._imagesRequestId += 1;
     this._bookingsRequestId += 1;
@@ -2268,6 +2289,7 @@ export class FrickeldaveStorePanel extends LitElement {
       imagesBusy: true,
       imagesError: "",
       imagesNotice: "",
+      imagesCaptureNotice: "",
       imagesPendingDelete: null,
       imagesUploadResults: [],
       imagesOptimizeResult: null,
@@ -2316,25 +2338,239 @@ export class FrickeldaveStorePanel extends LitElement {
     }
   }
 
+  /**
+   * Öffnet die Kamera im Panel.
+   *
+   * Android-WebView-Hosts (auch die Home-Assistant-App) ignorieren den `capture`-Hinweis
+   * am Datei-Input und zeigen stattdessen die Galerie. Deshalb wird die Kamera über
+   * `getUserMedia` geöffnet; das `capture`-Input bleibt der Rückfallweg.
+   */
   _openCapture() {
     const editor = this._editor;
-    if (!editor || editor.mode !== "edit" || this._imageBusy()) {
-      return;
-    }
-    const unavailable =
-      "Kamera nicht verfügbar. Bitte die Kamera-Berechtigung der Home-Assistant-App in den " +
-      "Systemeinstellungen prüfen.";
-    const input = this.renderRoot?.querySelector("#fd-image-capture");
-    if (!input) {
-      this._patchEditor({ imagesCaptureNotice: "", imagesError: unavailable });
+    if (!editor || editor.mode !== "edit" || this._imageBusy() || this._camera) {
       return;
     }
     this._patchEditor({ imagesCaptureNotice: "", imagesError: "" });
+    const media = globalThis.navigator?.mediaDevices;
+    if (!media || typeof media.getUserMedia !== "function") {
+      // Ohne getUserMedia (z. B. unsicherer Kontext) ist der `capture`-Hinweis die letzte Chance.
+      this._openCaptureInput("");
+      return;
+    }
+    this._startCamera();
+  }
+
+  async _startCamera() {
+    this._camera = { status: "starting" };
+    document.addEventListener("keydown", this._onCameraKeydown, true);
+    this.updateComplete
+      .then(() => this.renderRoot?.querySelector("#fd-camera-dialog")?.focus?.())
+      .catch(() => {});
+
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
+      });
+    } catch {
+      stream = null;
+    }
+
+    if (!stream) {
+      // Kamera verweigert oder nicht vorhanden: der Datei-Input bleibt als Rückfallweg,
+      // der Hinweis erklärt, warum die Kamera nicht geöffnet wurde.
+      this._detachCameraKeydown();
+      this._camera = null;
+      this._openCaptureInput(CAMERA_UNAVAILABLE_TEXT);
+      return;
+    }
+    if (!this._camera || !this.isConnected) {
+      // Abgebrochen, während die Berechtigung angefragt wurde.
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      return;
+    }
+    this._cameraStream = stream;
+    this._camera = { status: "live" };
+    this.updateComplete
+      .then(() => {
+        const video = this.renderRoot?.querySelector("#fd-camera-preview");
+        if (!video || !this._cameraStream) {
+          return;
+        }
+        video.srcObject = this._cameraStream;
+        const playing = video.play?.();
+        if (playing && typeof playing.catch === "function") {
+          playing.catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }
+
+  /** Rückfallweg: das versteckte `capture`-Input, das auf Kamera-fähigen Hosts die Kamera öffnet. */
+  _openCaptureInput(notice) {
+    const input = this.renderRoot?.querySelector("#fd-image-capture");
+    if (!input) {
+      this._patchEditor({ imagesCaptureNotice: "", imagesError: notice || CAMERA_UNAVAILABLE_TEXT });
+      return;
+    }
+    this._patchEditor({ imagesCaptureNotice: notice || "", imagesError: "" });
     try {
       input.click();
     } catch {
-      this._patchEditor({ imagesError: unavailable });
+      this._patchEditor({ imagesCaptureNotice: "", imagesError: notice || CAMERA_UNAVAILABLE_TEXT });
     }
+  }
+
+  _stopCameraStream() {
+    const stream = this._cameraStream;
+    this._cameraStream = null;
+    const video = this.renderRoot?.querySelector("#fd-camera-preview");
+    if (video) {
+      video.srcObject = null;
+    }
+    if (!stream || typeof stream.getTracks !== "function") {
+      return;
+    }
+    for (const track of stream.getTracks()) {
+      track?.stop?.();
+    }
+  }
+
+  _closeCamera({ cancelled = false } = {}) {
+    const wasOpen = Boolean(this._camera);
+    this._stopCameraStream();
+    this._camera = null;
+    this._detachCameraKeydown();
+    if (cancelled && wasOpen) {
+      this._patchEditor({ imagesCaptureNotice: CAMERA_CANCELLED_TEXT, imagesError: "" });
+    }
+    if (wasOpen) {
+      this.updateComplete
+        .then(() => this.renderRoot?.querySelector("#fd-capture-button")?.focus?.())
+        .catch(() => {});
+    }
+  }
+
+  _detachCameraKeydown() {
+    document.removeEventListener("keydown", this._onCameraKeydown, true);
+  }
+
+  _handleCameraKeydown(event) {
+    if (event.key !== "Escape" || !this._camera) {
+      return;
+    }
+    // Sonst schließt die Escape-Taste zusätzlich den Produktdialog.
+    event.preventDefault();
+    event.stopPropagation();
+    this._closeCamera({ cancelled: true });
+  }
+
+  /** Zieht das aktuelle Videobild auf ein Canvas und gibt es als JPEG an den bestehenden Uploadweg. */
+  _takePhoto() {
+    const camera = this._camera;
+    const editor = this._editor;
+    if (!camera || camera.status !== "live" || !this._cameraStream) {
+      return;
+    }
+    if (!editor || editor.mode !== "edit" || this._imageBusy()) {
+      this._closeCamera();
+      return;
+    }
+    const video = this.renderRoot?.querySelector("#fd-camera-preview");
+    if (!video) {
+      this._closeCamera({ cancelled: true });
+      return;
+    }
+    if (!video.videoWidth || !video.videoHeight) {
+      if (video.readyState >= 1) {
+        // Metadaten stehen, aber es gibt kein Bild (z. B. Kamera liefert nichts).
+        this._closeCamera({ cancelled: true });
+        return;
+      }
+      // Direkt nach dem Öffnen fehlen die Maße noch: einmal auf die Metadaten warten.
+      video.addEventListener("loadedmetadata", () => this._takePhoto(), { once: true });
+      return;
+    }
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    // Lange Kante wie die Servergrenze begrenzen: spart Speicher und Uploadzeit ohne Qualitätsverlust.
+    const scale = Math.min(1, CAMERA_MAX_EDGE / Math.max(width, height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    const context = canvas.getContext("2d");
+    if (!context || typeof canvas.toBlob !== "function") {
+      this._closeCamera();
+      this._openCaptureInput(CAMERA_UNAVAILABLE_TEXT);
+      return;
+    }
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    // Sofort schließen: ein zweiter Tipp auf „Auslösen“ darf kein zweites Foto starten.
+    this._closeCamera();
+    canvas.toBlob((blob) => this._onPhotoCaptured(blob), "image/jpeg", 0.9);
+  }
+
+  async _onPhotoCaptured(blob) {
+    if (!blob) {
+      this._patchEditor({ imagesCaptureNotice: CAMERA_CANCELLED_TEXT, imagesError: "" });
+      return;
+    }
+    const file = new File([blob], `aufnahme-${Date.now()}.jpg`, {
+      type: "image/jpeg",
+      lastModified: Date.now(),
+    });
+    await this._onImagesSelected({ target: { files: [file], value: "" } });
+  }
+
+  _renderCameraOverlay() {
+    const camera = this._camera;
+    if (!camera) {
+      return "";
+    }
+    const starting = camera.status !== "live";
+    return html`
+      <div
+        id="fd-camera-dialog"
+        class="fd-camera"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="fd-camera-title"
+        tabindex="-1"
+      >
+        <h3 id="fd-camera-title" class="fd-camera-title">Foto aufnehmen</h3>
+        <div class="fd-camera-view">
+          <video
+            id="fd-camera-preview"
+            class="fd-camera-preview"
+            ?hidden=${starting}
+            autoplay
+            playsinline
+            muted
+          ></video>
+          ${starting
+            ? html`<p class="fd-camera-status" role="status">
+                <span class="fd-spinner" aria-hidden="true"></span> Kamera wird geöffnet …
+              </p>`
+            : ""}
+        </div>
+        <div class="fd-camera-actions">
+          <button
+            type="button"
+            class="fd-button fd-button--primary"
+            @click=${() => this._takePhoto()}
+            ?disabled=${starting}
+          >
+            Auslösen
+          </button>
+          <button type="button" class="fd-button" @click=${() => this._closeCamera({ cancelled: true })}>
+            Abbrechen
+          </button>
+        </div>
+      </div>
+    `;
   }
 
   async _onCaptureSelected(event) {
@@ -2349,7 +2585,7 @@ export class FrickeldaveStorePanel extends LitElement {
       return;
     }
     if (!file) {
-      this._patchEditor({ imagesCaptureNotice: "Es wurde kein Foto aufgenommen." });
+      this._patchEditor({ imagesCaptureNotice: CAMERA_CANCELLED_TEXT });
       return;
     }
     const type = typeof file.type === "string" ? file.type.toLowerCase() : "";
@@ -2357,8 +2593,7 @@ export class FrickeldaveStorePanel extends LitElement {
     if (type.startsWith("image/heic") || type.startsWith("image/heif") || /\.(heic|heif)$/i.test(name)) {
       this._patchEditor({
         imagesCaptureNotice: "",
-        imagesError:
-          "Dieses Bildformat wird nicht unterstützt. Bitte ein Foto aufnehmen oder als JPEG hochladen.",
+        imagesError: CAPTURE_FORMAT_TEXT,
       });
       return;
     }
@@ -2376,7 +2611,7 @@ export class FrickeldaveStorePanel extends LitElement {
     if (!editor || editor.mode !== "edit") {
       return;
     }
-    this._patchEditor({ imagesCaptureNotice: "Es wurde kein Foto aufgenommen." });
+    this._patchEditor({ imagesCaptureNotice: CAMERA_CANCELLED_TEXT });
   }
 
   async _moveImage(index, delta) {
@@ -4362,6 +4597,7 @@ export class FrickeldaveStorePanel extends LitElement {
             </div>
           </footer>
         </form>
+        ${this._renderCameraOverlay()}
       </dialog>
     `;
   }
@@ -4644,6 +4880,7 @@ export class FrickeldaveStorePanel extends LitElement {
             @cancel=${() => this._onCaptureCancelled()}
           />
           <button
+            id="fd-capture-button"
             type="button"
             class="fd-button fd-button--primary"
             ?disabled=${busy || images.length >= MAX_IMAGES}
@@ -7355,6 +7592,67 @@ export class FrickeldaveStorePanel extends LitElement {
         flex-direction: column;
         gap: 6px;
       }
+    }
+
+    /* Kamera-Overlay (getUserMedia): liegt im Dialog über dem Bilder-Tab. */
+    .fd-camera {
+      position: fixed;
+      inset: 0;
+      z-index: 5;
+      display: flex;
+      flex-direction: column;
+      gap: var(--fd-space-3);
+      padding: var(--fd-space-4);
+      background: rgba(0, 0, 0, 0.92);
+      color: #fff;
+    }
+
+    .fd-camera:focus {
+      outline: none;
+    }
+
+    .fd-camera-title {
+      margin: 0;
+      font-size: var(--ha-font-size-l, 1.25rem);
+      font-weight: 500;
+      text-align: center;
+    }
+
+    .fd-camera-view {
+      position: relative;
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      border-radius: var(--fd-radius);
+      background: #000;
+    }
+
+    .fd-camera-preview {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+
+    .fd-camera-preview[hidden] {
+      display: none;
+    }
+
+    .fd-camera-status {
+      margin: 0;
+      padding: var(--fd-space-3);
+      color: #fff;
+      text-align: center;
+    }
+
+    .fd-camera-actions {
+      display: flex;
+      flex: none;
+      justify-content: center;
+      gap: var(--fd-space-2);
     }
 
     .fd-image-grid {

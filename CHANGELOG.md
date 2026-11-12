@@ -53,6 +53,20 @@ Versionierung nach [SemVer](https://semver.org/lang/de/).
 
 ### Fixed
 
+- **„Foto aufnehmen“ öffnet auf Android wieder die Kamera statt der Galerie (#321).**
+  In der Home-Assistant-Companion-App (Fairphone und Motorola) zeigte die
+  Schaltfläche „Foto aufnehmen“ denselben Datei-/Galerie-Dialog wie „Bilder
+  hochladen“: Der WebView-Host wertet den `capture="environment"`-Hinweis des
+  Datei-Inputs nicht aus, sondern startet unbesehen einen `ACTION_GET_CONTENT`-
+  Picker. Das Panel öffnet die Kamera jetzt selbst über `getUserMedia`
+  (Rückkamera bevorzugt) und zeigt eine Vorschau mit „Auslösen“ und
+  „Abbrechen“; das Standbild wird als JPEG übernommen und durchläuft unverändert
+  die bestehende Prüfung (maximal zehn Bilder, 10 MiB, Upload über
+  `POST /api/frickeldave_store/products/{artikelnummer}/images`). Der
+  Kamerastream wird beim Schließen, beim Abbrechen und beim Entfernen des
+  Panels beendet. Wo `getUserMedia` nicht verfügbar ist oder die Berechtigung
+  fehlt, bleibt das `capture`-Input der Rückfallweg und der Hinweis nennt die
+  Kamera-Berechtigung der App.
 - **Panel verbindet wieder: `fetchWithAuth` bekommt einen relativen Pfad (#289).**
   Seit 0.2.6 übergab das Panel `hass.fetchWithAuth` eine absolute URL. Home
   Assistant stellt die Instanz-URL selbst voran, sodass eine ungültige URL wie
