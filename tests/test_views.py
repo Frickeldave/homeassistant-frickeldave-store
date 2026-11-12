@@ -24,7 +24,7 @@ from custom_components.frickeldave_store.const import (
 from custom_components.frickeldave_store.models import SCHEMA_VERSION, Image
 from custom_components.frickeldave_store.permissions import PermissionManager
 from custom_components.frickeldave_store.products import ProductService
-from custom_components.frickeldave_store.store import CatalogStore
+from custom_components.frickeldave_store.store import MAX_IMAGE_BYTES, CatalogStore
 from custom_components.frickeldave_store.views import (
     VIEWS,
     ArchiveView,
@@ -331,6 +331,79 @@ async def test_eleventh_image_upload_rejected_via_api(tmp_path: Path) -> None:
     assert _payload(rejected)["error"]["code"] == "image_limit"
     listing = await ImagesView().get(FakeRequest(hass, "user-1"), article)
     assert len(_payload(listing)["images"]) == 10
+
+
+async def _product_with_one_image(
+    tmp_path: Path,
+) -> tuple[FakeHass, FrickeldaveStoreRuntime, str, list[str]]:
+    """Produkt mit genau einem gespeicherten JPEG als Ausgangslage für Ablehnungstests."""
+
+    hass, runtime = await _setup(tmp_path, {"user-1": ["product"]})
+    create = await ProductsView().post(
+        FakeRequest(hass, "user-1", body={"name": "Schild", "category": "LA"})
+    )
+    article = _payload(create)["articleNumber"]
+    accepted = await ImagesView().post(
+        FakeRequest(
+            hass,
+            "user-1",
+            upload=SimpleNamespace(
+                content_type="image/jpeg", filename="bild.jpg", file=io.BytesIO(_JPEG)
+            ),
+        ),
+        article,
+    )
+    assert accepted.status == 201
+    return hass, runtime, article, await runtime.store.images.async_list(article)
+
+
+@pytest.mark.parametrize(
+    ("content_type", "filename"),
+    [("image/heic", "IMG_0001.HEIC"), ("application/pdf", "rechnung.pdf")],
+)
+async def test_disallowed_image_content_type_rejected_without_new_file(
+    tmp_path: Path, content_type: str, filename: str
+) -> None:
+    hass, runtime, article, before = await _product_with_one_image(tmp_path)
+
+    rejected = await ImagesView().post(
+        FakeRequest(
+            hass,
+            "user-1",
+            upload=SimpleNamespace(
+                content_type=content_type, filename=filename, file=io.BytesIO(_JPEG)
+            ),
+        ),
+        article,
+    )
+
+    assert rejected.status == 415
+    assert _payload(rejected) == {
+        "error": {
+            "code": "unsupported_media_type",
+            "message": "Nur JPEG, PNG, WebP und GIF werden unterstützt.",
+        }
+    }
+    assert await runtime.store.images.async_list(article) == before
+    assert len((await runtime.products.async_get(article)).images) == 1
+
+
+async def test_oversized_image_rejected_without_new_file(tmp_path: Path) -> None:
+    hass, runtime, article, before = await _product_with_one_image(tmp_path)
+    oversized = SimpleNamespace(
+        content_type="image/jpeg",
+        filename="kamera.jpg",
+        file=io.BytesIO(b"\x00" * (MAX_IMAGE_BYTES + 1)),
+    )
+
+    rejected = await ImagesView().post(FakeRequest(hass, "user-1", upload=oversized), article)
+
+    assert rejected.status == 413
+    assert _payload(rejected) == {
+        "error": {"code": "file_too_large", "message": "Das Bild ist größer als 10 MB."}
+    }
+    assert await runtime.store.images.async_list(article) == before
+    assert len((await runtime.products.async_get(article)).images) == 1
 
 
 async def test_settings_requires_admin_and_hides_api_key(tmp_path: Path) -> None:
